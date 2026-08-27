@@ -12,6 +12,7 @@ use landlock::{
 };
 
 pub const HELPER_ARG: &str = "__catdesk_landlock_exec";
+const ALLOW_UNSANDBOXED_ENV: &str = "CATDESK_ALLOW_UNSANDBOXED_LINUX";
 
 // ABI v3 is the minimum safe baseline for filesystem confinement because it
 // adds control over truncate(2). Older ABIs could otherwise leave an outside
@@ -152,6 +153,30 @@ fn runtime_write_paths() -> BTreeSet<PathBuf> {
     paths
 }
 
+fn allow_unsandboxed_linux() -> bool {
+    std::env::var_os(ALLOW_UNSANDBOXED_ENV)
+        .as_deref()
+        .is_some_and(|value| value == OsStr::new("1"))
+}
+
+fn validate_ruleset_status(status: RulesetStatus, allow_unsandboxed: bool) -> io::Result<()> {
+    match status {
+        RulesetStatus::FullyEnforced => Ok(()),
+        RulesetStatus::PartiallyEnforced => Err(io::Error::other(
+            "Landlock sandbox was only partially enforced",
+        )),
+        RulesetStatus::NotEnforced if allow_unsandboxed => {
+            eprintln!(
+                "WARNING: Landlock is unavailable; running command without kernel filesystem isolation because {ALLOW_UNSANDBOXED_ENV}=1"
+            );
+            Ok(())
+        }
+        RulesetStatus::NotEnforced => Err(io::Error::other(format!(
+            "Landlock sandbox is unavailable. Set {ALLOW_UNSANDBOXED_ENV}=1 only if you explicitly accept running commands without kernel filesystem isolation"
+        ))),
+    }
+}
+
 pub fn apply_workspace_landlock(
     workspace: &Path,
     scratch: &Path,
@@ -182,7 +207,7 @@ pub fn apply_workspace_landlock(
     write_paths.insert(scratch);
 
     let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
+        .set_compatibility(CompatLevel::BestEffort)
         .handle_access(access_all)?
         .create()?
         .add_rules(path_beneath_rules(&read_paths, access_read))?
@@ -190,14 +215,7 @@ pub fn apply_workspace_landlock(
         .no_new_privs(true)
         .restrict_self()?;
 
-    if ruleset.ruleset != RulesetStatus::FullyEnforced {
-        return Err(io::Error::other(format!(
-            "Landlock sandbox was not fully enforced: {:?}",
-            ruleset.ruleset
-        ))
-        .into());
-    }
-
+    validate_ruleset_status(ruleset.ruleset, allow_unsandboxed_linux())?;
     Ok(())
 }
 
@@ -272,5 +290,31 @@ mod tests {
     fn runtime_write_paths_do_not_grant_global_tmp() {
         let tmp = Path::new("/tmp").canonicalize().expect("canonical /tmp");
         assert!(!runtime_write_paths().contains(&tmp));
+    }
+
+    #[test]
+    fn fully_enforced_ruleset_is_accepted() {
+        validate_ruleset_status(RulesetStatus::FullyEnforced, false)
+            .expect("fully enforced ruleset");
+    }
+
+    #[test]
+    fn partially_enforced_ruleset_is_rejected() {
+        let error = validate_ruleset_status(RulesetStatus::PartiallyEnforced, true)
+            .expect_err("partially enforced ruleset must be rejected");
+        assert!(error.to_string().contains("partially enforced"));
+    }
+
+    #[test]
+    fn unavailable_ruleset_requires_explicit_opt_in() {
+        let error = validate_ruleset_status(RulesetStatus::NotEnforced, false)
+            .expect_err("unavailable Landlock must be rejected without opt-in");
+        assert!(error.to_string().contains(ALLOW_UNSANDBOXED_ENV));
+    }
+
+    #[test]
+    fn unavailable_ruleset_is_allowed_with_explicit_opt_in() {
+        validate_ruleset_status(RulesetStatus::NotEnforced, true)
+            .expect("explicit opt-in should allow an unavailable Landlock ruleset");
     }
 }
