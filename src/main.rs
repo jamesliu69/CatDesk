@@ -33,8 +33,8 @@ use ratatui::{
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UiLanguage, UsageTotals, flow_anim_lit_count, load_macos_terminal_profile,
-    load_public_base_url, save_macos_terminal_profile, save_public_base_url, user_home_dir,
+    ToolMode, UiLanguage, UsageTotals, flow_anim_lit_count, load_public_base_url,
+    save_public_base_url, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -1065,42 +1065,6 @@ fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<
 
 // ── Main ────────────────────────────────────────────────────
 
-fn parse_terminal_profile_choice(input: &str) -> Option<bool> {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "" | "y" | "yes" => Some(true),
-        "n" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn prompt_macos_terminal_profile() -> std::io::Result<bool> {
-    loop {
-        println!("CatDesk can apply its Terminal.app profile for the best TUI appearance.");
-        print!("Use the CatDesk Terminal.app profile? [Y/n]: ");
-        std::io::stdout().flush()?;
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if let Some(enabled) = parse_terminal_profile_choice(&input) {
-            return Ok(enabled);
-        }
-        eprintln!("Please answer y/yes or n/no.");
-    }
-}
-
-fn macos_terminal_profile_enabled() -> std::io::Result<bool> {
-    if !macos_terminal::should_prompt_for_terminal_profile() {
-        return Ok(true);
-    }
-    if let Some(enabled) = load_macos_terminal_profile()? {
-        return Ok(enabled);
-    }
-
-    let enabled = prompt_macos_terminal_profile()?;
-    save_macos_terminal_profile(enabled)?;
-    Ok(enabled)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
@@ -1109,8 +1073,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unreachable!("Landlock helper returned after exec");
     }
 
-    let terminal_profile_enabled = macos_terminal_profile_enabled()?;
-    match macos_terminal::maybe_relaunch_in_terminal_profile(terminal_profile_enabled) {
+    match macos_terminal::maybe_relaunch_in_terminal_profile() {
         Ok(macos_terminal::LaunchAction::Continue) => {}
         #[cfg(target_os = "macos")]
         Ok(macos_terminal::LaunchAction::ExitAfterProfileBootstrap) => {
@@ -1798,7 +1761,7 @@ mod tests {
     use super::{
         LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_tui_header,
         export_logs_to_dir, mask_mcp_path_in_log, normalize_public_base_url_input,
-        parse_terminal_profile_choice, wrap_log_message,
+        wrap_log_message,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
@@ -1848,16 +1811,6 @@ mod tests {
         assert!(chinese_compact.contains("控制瀏覽器"));
         assert!(chinese_compact.contains("語言：繁體中文"));
         assert!(chinese_compact.contains("離開"));
-    }
-
-    #[test]
-    fn parses_terminal_profile_choice() {
-        assert_eq!(parse_terminal_profile_choice(""), Some(true));
-        assert_eq!(parse_terminal_profile_choice(" y "), Some(true));
-        assert_eq!(parse_terminal_profile_choice("YES"), Some(true));
-        assert_eq!(parse_terminal_profile_choice("n"), Some(false));
-        assert_eq!(parse_terminal_profile_choice(" No "), Some(false));
-        assert_eq!(parse_terminal_profile_choice("maybe"), None);
     }
 
     #[test]

@@ -1,4 +1,8 @@
 #[cfg(target_os = "macos")]
+use crate::state::{load_macos_terminal_profile, save_macos_terminal_profile};
+#[cfg(any(target_os = "macos", test))]
+use std::io::{self, BufRead, Write};
+#[cfg(target_os = "macos")]
 use std::{
     env,
     ffi::CStr,
@@ -61,11 +65,56 @@ pub enum LaunchAction {
     ExitAfterProfileBootstrap,
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_terminal_profile_choice(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn prompt_for_terminal_profile(
-    _input: &mut impl std::io::BufRead,
-    _output: &mut impl std::io::Write,
-) -> std::io::Result<bool> {
-    Ok(true)
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> io::Result<bool> {
+    loop {
+        writeln!(
+            output,
+            "CatDesk can apply its Terminal.app profile for the best TUI appearance."
+        )?;
+        write!(output, "Use the CatDesk Terminal.app profile? [Y/n]: ")?;
+        output.flush()?;
+
+        let mut choice = String::new();
+        if input.read_line(&mut choice)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stdin closed before a Terminal.app profile choice was made",
+            ));
+        }
+        if let Some(enabled) = parse_terminal_profile_choice(&choice) {
+            return Ok(enabled);
+        }
+        writeln!(output, "Please answer y/yes or n/no.")?;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_profile_enabled() -> io::Result<bool> {
+    if !should_manage_terminal_launch() {
+        return Ok(true);
+    }
+    if let Some(enabled) = load_macos_terminal_profile()? {
+        return Ok(enabled);
+    }
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let enabled = prompt_for_terminal_profile(&mut stdin.lock(), &mut stdout.lock())?;
+    save_macos_terminal_profile(enabled)?;
+    Ok(enabled)
 }
 
 #[cfg(target_os = "macos")]
@@ -74,7 +123,9 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-pub fn maybe_relaunch_in_terminal_profile(profile_enabled: bool) -> Result<LaunchAction, String> {
+pub fn maybe_relaunch_in_terminal_profile() -> Result<LaunchAction, String> {
+    let profile_enabled = terminal_profile_enabled()
+        .map_err(|error| format!("failed to read Terminal.app profile preference: {error}"))?;
     if !profile_enabled || !should_manage_terminal_launch() {
         return Ok(LaunchAction::Continue);
     }
@@ -132,18 +183,8 @@ pub fn maybe_relaunch_in_terminal_profile(profile_enabled: bool) -> Result<Launc
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn maybe_relaunch_in_terminal_profile(_profile_enabled: bool) -> Result<LaunchAction, String> {
+pub fn maybe_relaunch_in_terminal_profile() -> Result<LaunchAction, String> {
     Ok(LaunchAction::Continue)
-}
-
-#[cfg(target_os = "macos")]
-pub fn should_prompt_for_terminal_profile() -> bool {
-    should_manage_terminal_launch()
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn should_prompt_for_terminal_profile() -> bool {
-    false
 }
 
 #[cfg(target_os = "macos")]
@@ -573,5 +614,15 @@ mod tests {
         let error = prompt_for_terminal_profile(&mut input, &mut output).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn parses_terminal_profile_choice() {
+        assert_eq!(parse_terminal_profile_choice(""), Some(true));
+        assert_eq!(parse_terminal_profile_choice(" y "), Some(true));
+        assert_eq!(parse_terminal_profile_choice("YES"), Some(true));
+        assert_eq!(parse_terminal_profile_choice("n"), Some(false));
+        assert_eq!(parse_terminal_profile_choice(" No "), Some(false));
+        assert_eq!(parse_terminal_profile_choice("maybe"), None);
     }
 }
