@@ -103,10 +103,7 @@ fn with_widget_action_cors(
         header::ACCESS_CONTROL_ALLOW_METHODS,
         "GET, POST, DELETE, OPTIONS",
     );
-    builder = builder.header(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "content-type, ngrok-skip-browser-warning",
-    );
+    builder = builder.header(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type");
     builder = builder.header(header::CACHE_CONTROL, "no-store");
     builder
 }
@@ -2300,7 +2297,7 @@ mod tests {
 
         attach_catdesk_instruction_actions(
             &mut result,
-            Some("https://example.ngrok.app"),
+            Some("https://catdesk.example.com"),
             "/secret-slug/mcp",
             0xff,
             Some("deadbeef"),
@@ -2328,7 +2325,7 @@ mod tests {
             widget_payload
                 .get("binagotchyApiBaseUrl")
                 .and_then(Value::as_str),
-            Some("https://example.ngrok.app/secret-slug/binagotchy")
+            Some("https://catdesk.example.com/secret-slug/binagotchy")
         );
         assert_eq!(
             widget_payload
@@ -2340,37 +2337,37 @@ mod tests {
             widget_payload
                 .get("agentsPathModeUrl")
                 .and_then(Value::as_str),
-            Some("https://example.ngrok.app/secret-slug/agents/path-mode")
+            Some("https://catdesk.example.com/secret-slug/agents/path-mode")
         );
         assert_eq!(
             widget_payload
                 .get("agentsPathStateUrl")
                 .and_then(Value::as_str),
-            Some("https://example.ngrok.app/secret-slug/agents/path-state")
+            Some("https://catdesk.example.com/secret-slug/agents/path-state")
         );
         assert_eq!(
             widget_payload
                 .get("tokenStatsLayoutUrl")
                 .and_then(Value::as_str),
-            Some("https://example.ngrok.app/secret-slug/layout/token-stats")
+            Some("https://catdesk.example.com/secret-slug/layout/token-stats")
         );
         assert_eq!(
             widget_payload
                 .get("showDetailModeUrl")
                 .and_then(Value::as_str),
-            Some("https://example.ngrok.app/secret-slug/layout/show-detail")
+            Some("https://catdesk.example.com/secret-slug/layout/show-detail")
         );
         assert!(widget_payload.get("widgetMascot").is_some());
         assert_eq!(card.get("isPartner").and_then(Value::as_bool), Some(true));
         assert_eq!(
             card.get("saveFolderUrl").and_then(Value::as_str),
             Some(
-                "https://example.ngrok.app/secret-slug/binagotchy/archive/20260403T010203000Z_deadbeef/save"
+                "https://catdesk.example.com/secret-slug/binagotchy/archive/20260403T010203000Z_deadbeef/save"
             )
         );
         assert_eq!(
             card.get("setPartnerUrl").and_then(Value::as_str),
-            Some("https://example.ngrok.app/secret-slug/binagotchy/partner")
+            Some("https://catdesk.example.com/secret-slug/binagotchy/partner")
         );
     }
 
@@ -2959,7 +2956,7 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
-        ngrok_url,
+        public_base_url,
         mcp_path,
         partner_binagotchy_seed,
         app_show_detail_mode,
@@ -2971,7 +2968,7 @@ async fn post_mcp_inner(
             app.mode,
             app.tool_mode,
             app.set_catdesk_as_co_author,
-            app.ngrok_url.clone(),
+            app.public_base_url.clone(),
             app.mcp_path(),
             app.partner_binagotchy_seed.clone(),
             app.show_detail_mode,
@@ -2996,7 +2993,7 @@ async fn post_mcp_inner(
         &req,
         &workspace_root,
         mascot_seed,
-        ngrok_url.as_deref(),
+        public_base_url.as_deref(),
         mode,
         tool_mode,
         set_catdesk_as_co_author,
@@ -3036,7 +3033,7 @@ async fn post_mcp_inner(
             attach_history_usage(&mut resp.result, &usage_totals);
             attach_catdesk_instruction_actions(
                 &mut resp.result,
-                ngrok_url.as_deref(),
+                public_base_url.as_deref(),
                 &mcp_path,
                 mascot_seed,
                 partner_binagotchy_seed.as_deref(),

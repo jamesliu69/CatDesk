@@ -9,7 +9,6 @@ mod linux_sandbox;
 mod macos_terminal;
 mod mascot;
 mod mcp;
-mod ngrok;
 mod process_runner;
 mod server;
 mod startup;
@@ -21,7 +20,7 @@ use crossterm::{
     ExecutableCommand,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -34,9 +33,8 @@ use ratatui::{
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UiLanguage, UsageTotals, app_config_path, flow_anim_lit_count,
-    load_macos_terminal_profile, load_ngrok_authtoken, load_ngrok_domain,
-    save_macos_terminal_profile, save_ngrok_authtoken, save_ngrok_domain, user_home_dir,
+    ToolMode, UiLanguage, UsageTotals, flow_anim_lit_count, load_macos_terminal_profile,
+    load_public_base_url, save_macos_terminal_profile, save_public_base_url, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -54,15 +52,12 @@ const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
 const MCP_PATH_MASK: &str = "/▓▓▓▓▓▓▓▓/mcp";
-const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
-const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 const STATUS_LABEL_WIDTH: usize = 19;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
-const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 const CHATGPT_CONNECTOR_SETTINGS_URL: &str = "https://chatgpt.com/apps#settings/Connectors";
 const CHATGPT_PLUGIN_SETTINGS_URL: &str = "https://chatgpt.com/#settings/Plugins";
 
@@ -337,10 +332,7 @@ fn mask_mcp_path_in_log(message: &str, revealed: bool) -> String {
 }
 
 fn is_secret_log_message(message: &str) -> bool {
-    message.starts_with("MCP Server URL: ")
-        || message.starts_with("ngrok URL: ")
-        || message.starts_with("Auto-saved ngrok static domain: ")
-        || post_mcp_path(message).is_some()
+    message.starts_with("MCP Server URL: ") || post_mcp_path(message).is_some()
 }
 
 fn mask_secret_log_message(message: &str, revealed: bool) -> String {
@@ -350,21 +342,11 @@ fn mask_secret_log_message(message: &str, revealed: bool) -> String {
     if message.starts_with("MCP Server URL: ") {
         return format!("MCP Server URL: {MCP_URL_MASK}");
     }
-    if message.starts_with("ngrok URL: ") {
-        return format!("ngrok URL: {NGROK_URL_MASK}");
-    }
-    if message.starts_with("Auto-saved ngrok static domain: ") {
-        return format!("Auto-saved ngrok static domain: {NGROK_DOMAIN_MASK}");
-    }
     mask_mcp_path_in_log(message, false)
 }
 
 fn secret_log_copy_value(message: &str) -> Option<String> {
-    message
-        .strip_prefix("MCP Server URL: ")
-        .or_else(|| message.strip_prefix("ngrok URL: "))
-        .or_else(|| message.strip_prefix("Auto-saved ngrok static domain: "))
-        .map(str::to_string)
+    message.strip_prefix("MCP Server URL: ").map(str::to_string)
 }
 
 fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
@@ -839,8 +821,8 @@ fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Opti
 }
 
 fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
-    let both_running = app.server_running && app.ngrok_running;
-    let has_url = app.ngrok_url.is_some();
+    let server_running = app.server_running;
+    let has_url = app.public_base_url.is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -851,7 +833,7 @@ fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
         .map(|t| now_millis.saturating_sub(t) < REMOTE_CONNECT_UI_GRACE_MS)
         .unwrap_or(false);
     !app.is_returning_user
-        && both_running
+        && server_running
         && has_url
         && !app.remote_connected
         && visible_flow_count == 0
@@ -960,15 +942,14 @@ fn build_animation_snapshot(app: &AppState) -> Vec<String> {
     {
         let latest_action = latest_flow_action(flow);
         let closing = flow.closing_started_ms.is_some();
-        let lane_active = closing
-            || !flow.anim_queue.is_empty()
-            || (app.server_running && app.ngrok_running && app.remote_connected);
+        let lane_active =
+            closing || !flow.anim_queue.is_empty() || (app.server_running && app.remote_connected);
         let direction = Some(flow_direction(Some(flow), now_millis)).filter(|_| lane_active);
         let phase = flow_phase(flow, now_millis);
         let lit = flow_lit_count(Some(flow), now_millis, FLOW_ROW_CELLS);
         let lane = debug_lane(direction, lit, FLOW_ROW_CELLS);
         rows.push(format!(
-            "flow {} phase={:<8} tool={:<16} Your computer {} ChatGPT Web (via Ngrok)",
+            "flow {} phase={:<8} tool={:<16} Your computer {} ChatGPT Web (via HTTPS)",
             flow.short_id, phase, latest_action, lane
         ));
     }
@@ -1051,90 +1032,29 @@ fn clipboard_copy(text: &str) -> bool {
         .is_ok()
 }
 
-#[cfg(target_os = "macos")]
-fn clipboard_paste() -> Option<String> {
-    let output = std::process::Command::new("/usr/bin/pbpaste")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .filter(|text| !text.is_empty())
-}
-
-#[cfg(target_os = "windows")]
-fn clipboard_paste() -> Option<String> {
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .filter(|text| !text.is_empty())
-}
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn clipboard_paste() -> Option<String> {
-    const CLIPBOARD_COMMANDS: &[(&str, &[&str])] = &[
-        ("wl-paste", &["-n"]),
-        ("xclip", &["-selection", "clipboard", "-o"]),
-        ("xsel", &["--clipboard", "--output"]),
-    ];
-
-    for (program, args) in CLIPBOARD_COMMANDS {
-        let output = match std::process::Command::new(program)
-            .args(*args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            Ok(output) if output.status.success() => output,
-            _ => continue,
-        };
-
-        if let Ok(text) = String::from_utf8(output.stdout) {
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-
-    None
-}
-
-fn key_is_clipboard_paste(key: &crossterm::event::KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Insert) && key.modifiers.contains(KeyModifiers::SHIFT)
-        || matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn text_input_key_is_cancel(code: KeyCode) -> bool {
-    matches!(code, KeyCode::Esc)
-}
-
-fn normalize_ngrok_authtoken_input(text: &str) -> String {
+fn normalize_public_base_url_input(text: &str) -> Result<String, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Err("Public base URL cannot be empty".into());
     }
-
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if let Some(idx) = parts.iter().position(|part| *part == "add-authtoken") {
-        if let Some(token) = parts.get(idx + 1) {
-            return token.trim_matches(['"', '\'']).to_string();
-        }
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|error| format!("Invalid public base URL: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("Public base URL must use https://".into());
     }
-
-    trimmed.to_string()
+    if url.host_str().is_none() {
+        return Err("Public base URL must include a hostname".into());
+    }
+    if url.username() != "" || url.password().is_some() {
+        return Err("Public base URL must not contain credentials".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Public base URL must not contain a query or fragment".into());
+    }
+    if !matches!(url.path(), "" | "/") {
+        return Err("Public base URL must not contain a path".into());
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<ServerUiEvent>) {
@@ -1250,9 +1170,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(handle) = app.server_handle.take() {
             handle.abort();
         }
-        if let Some(handle) = app.ngrok_task.take() {
-            handle.abort();
-        }
         if let Some(child) = app.remote_browser_child.as_mut() {
             let _ = child.start_kill();
         }
@@ -1260,8 +1177,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = child.start_kill();
         }
         app.server_running = false;
-        app.ngrok_running = false;
-        app.ngrok_url = None;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
     }
@@ -1326,12 +1241,7 @@ async fn run_app(
         }
     }
 
-    let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
-    if !continue_run {
-        return Ok(());
-    }
-
-    let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
+    let continue_run = run_public_base_url_setup(terminal, state.clone()).await?;
     if !continue_run {
         return Ok(());
     }
@@ -1819,440 +1729,43 @@ fn draw_mode_select(
     f.render_widget(select, chunks[1]);
 }
 
-async fn run_ngrok_auth_setup(
+async fn run_public_base_url_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if load_ngrok_authtoken()?.is_some() {
+    if let Some(url) = load_public_base_url()? {
+        state.lock().await.public_base_url = Some(url);
         return Ok(true);
     }
 
-    let config_path = app_config_path()?;
-    let config_path_text = config_path.to_string_lossy().into_owned();
-    let mut input = String::new();
-    let mut error_message: Option<String> = None;
-    let mut toast: Option<(&str, (u16, u16), Instant)> = None;
-
+    let mut initial = String::new();
     loop {
-        if let Some((_, _, t)) = &toast {
-            if t.elapsed().as_secs() >= 2 {
-                toast = None;
-            }
-        }
-
-        let (
-            current_theme,
-            current_tool_mode,
-            current_ui_language,
-            current_mode,
-            browsers,
-            selected_browser,
-        ) = {
-            let app = state.lock().await;
-            (
-                app.current_theme(),
-                app.tool_mode,
-                app.ui_language,
-                app.mode,
-                app.detected_browsers.clone(),
-                app.selected_browser.clone(),
-            )
+        let Some(input) = run_prompt(
+            terminal,
+            "Enter public HTTPS base URL for the external tunnel (for example https://catdesk.example.com):",
+            &initial,
+        )
+        .await?
+        else {
+            return Ok(false);
         };
-        let supported_indices: Vec<usize> = browsers
-            .iter()
-            .enumerate()
-            .filter(|(_, browser)| browser.mcp_supported)
-            .map(|(idx, _)| idx)
-            .collect();
-        let selected_supported_idx =
-            selected_supported_browser_idx(&browsers, selected_browser.as_ref());
-        let toast_ref = toast
-            .as_ref()
-            .filter(|(_, _, t)| t.elapsed().as_secs() < 2)
-            .map(|(m, pos, _)| (*m, *pos));
-        let mut ngrok_setup_copy_area = Rect::default();
-        terminal.draw(|f| {
-            let anchor_area = if current_mode.browser_enabled() {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(10),
-                        Constraint::Length(3),
-                    ])
-                    .split(f.area())[1]
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(17),
-                        Constraint::Min(0),
-                    ])
-                    .split(f.area())[1]
-            };
-            ngrok_setup_copy_area = ngrok_auth_setup_copy_area(anchor_area);
-            if current_mode.browser_enabled() {
-                draw_browser_select(
-                    f,
-                    &browsers,
-                    &supported_indices,
-                    selected_supported_idx,
-                    current_theme,
-                );
-            } else {
-                draw_mode_select(f, current_theme, current_tool_mode, current_ui_language);
-            }
-            draw_ngrok_auth_setup(
-                f,
-                current_theme,
-                anchor_area,
-                &config_path_text,
-                &masked_secret_preview(&input),
-                error_message.as_deref(),
-            );
-            if let Some((message, pos)) = toast_ref {
-                render_toast(f, current_theme.palette, message, pos);
-            }
-        })?;
 
-        if !event::poll(UI_POLL_INTERVAL)? {
-            continue;
-        }
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    code if text_input_key_is_cancel(code) => return Ok(false),
-                    KeyCode::Enter => {
-                        let token = normalize_ngrok_authtoken_input(&input);
-                        if token.is_empty() {
-                            error_message = Some("NGROK_AUTHTOKEN cannot be empty".into());
-                            continue;
-                        }
-                        match save_ngrok_authtoken(&token) {
-                            Ok(saved_path) => {
-                                let mut app = state.lock().await;
-                                app.log(
-                                    "INFO",
-                                    format!(
-                                        "Saved ngrok authtoken to {}",
-                                        saved_path.to_string_lossy()
-                                    ),
-                                );
-                                return Ok(true);
-                            }
-                            Err(e) => {
-                                error_message =
-                                    Some(format!("Failed to save ~/.catdesk/config.toml: {e}"));
-                            }
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        input.pop();
-                        error_message = None;
-                    }
-                    KeyCode::Char(c) => {
-                        if key_is_clipboard_paste(&key) {
-                            if let Some(text) = clipboard_paste() {
-                                input.push_str(&normalize_ngrok_authtoken_input(&text));
-                                error_message = None;
-                            }
-                        } else {
-                            input.push(c);
-                            error_message = None;
-                        }
-                    }
-                    KeyCode::Insert if key_is_clipboard_paste(&key) => {
-                        if let Some(text) = clipboard_paste() {
-                            input.push_str(&normalize_ngrok_authtoken_input(&text));
-                            error_message = None;
-                        }
-                    }
-                    _ => {}
-                }
+        match normalize_public_base_url_input(&input) {
+            Ok(url) => {
+                save_public_base_url(Some(&url))?;
+                let mut app = state.lock().await;
+                app.public_base_url = Some(url.clone());
+                app.log("INFO", format!("Public base URL configured: {url}"));
+                app.persist_state_with_log();
+                return Ok(true);
             }
-            Event::Paste(text) => {
-                input.push_str(&normalize_ngrok_authtoken_input(&text));
-                error_message = None;
+            Err(error) => {
+                initial = input;
+                let mut app = state.lock().await;
+                app.log("WARN", error);
             }
-            Event::Mouse(mouse) => {
-                if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
-                    && rect_contains(ngrok_setup_copy_area, mouse.column, mouse.row)
-                {
-                    let message = if clipboard_copy(NGROK_SETUP_URL) {
-                        "Copied!"
-                    } else {
-                        "Copy failed"
-                    };
-                    toast = Some((message, (mouse.column, mouse.row), Instant::now()));
-                }
-            }
-            _ => {}
         }
     }
-}
-
-async fn run_ngrok_domain_setup(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state: SharedState,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if load_ngrok_domain()?.is_some() {
-        return Ok(true);
-    }
-
-    let mut input = String::new();
-    let mut error_message: Option<String> = None;
-
-    loop {
-        let (
-            current_theme,
-            current_tool_mode,
-            current_ui_language,
-            current_mode,
-            browsers,
-            selected_browser,
-        ) = {
-            let app = state.lock().await;
-            (
-                app.current_theme(),
-                app.tool_mode,
-                app.ui_language,
-                app.mode,
-                app.detected_browsers.clone(),
-                app.selected_browser.clone(),
-            )
-        };
-        let supported_indices: Vec<usize> = browsers
-            .iter()
-            .enumerate()
-            .filter(|(_, browser)| browser.mcp_supported)
-            .map(|(idx, _)| idx)
-            .collect();
-        let selected_supported_idx =
-            selected_supported_browser_idx(&browsers, selected_browser.as_ref());
-        terminal.draw(|f| {
-            let anchor_area = if current_mode.browser_enabled() {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(10),
-                        Constraint::Length(3),
-                    ])
-                    .split(f.area())[1]
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(17),
-                        Constraint::Min(0),
-                    ])
-                    .split(f.area())[1]
-            };
-            if current_mode.browser_enabled() {
-                draw_browser_select(
-                    f,
-                    &browsers,
-                    &supported_indices,
-                    selected_supported_idx,
-                    current_theme,
-                );
-            } else {
-                draw_mode_select(f, current_theme, current_tool_mode, current_ui_language);
-            }
-            draw_ngrok_domain_setup(
-                f,
-                current_theme,
-                anchor_area,
-                &input,
-                error_message.as_deref(),
-            );
-        })?;
-
-        if !event::poll(UI_POLL_INTERVAL)? {
-            continue;
-        }
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    code if text_input_key_is_cancel(code) => return Ok(false),
-                    KeyCode::Enter => {
-                        let domain = normalize_ngrok_domain_input(&input);
-                        if domain.is_empty() {
-                            error_message = Some("ngrok domain cannot be empty".into());
-                            continue;
-                        }
-                        match save_ngrok_domain(&domain) {
-                            Ok(saved_path) => {
-                                let mut app = state.lock().await;
-                                app.ngrok_domain = Some(domain.clone());
-                                app.log(
-                                    "INFO",
-                                    format!(
-                                        "Saved ngrok domain to {}",
-                                        saved_path.to_string_lossy()
-                                    ),
-                                );
-                                return Ok(true);
-                            }
-                            Err(e) => {
-                                error_message =
-                                    Some(format!("Failed to save ~/.catdesk/config.toml: {e}"));
-                            }
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        input.pop();
-                        error_message = None;
-                    }
-                    KeyCode::Char(c) => {
-                        if key_is_clipboard_paste(&key) {
-                            if let Some(text) = clipboard_paste() {
-                                input.push_str(&normalize_ngrok_domain_input(&text));
-                                error_message = None;
-                            }
-                        } else {
-                            input.push(c);
-                            error_message = None;
-                        }
-                    }
-                    KeyCode::Insert if key_is_clipboard_paste(&key) => {
-                        if let Some(text) = clipboard_paste() {
-                            input.push_str(&normalize_ngrok_domain_input(&text));
-                            error_message = None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Event::Paste(text) => {
-                input.push_str(&normalize_ngrok_domain_input(&text));
-                error_message = None;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn normalize_ngrok_domain_input(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Ok(url) = reqwest::Url::parse(trimmed) {
-        if let Some(host) = url.host_str() {
-            return host.to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn draw_ngrok_domain_setup(
-    f: &mut Frame,
-    theme: &theme::ThemeDef,
-    anchor_area: Rect,
-    domain_value: &str,
-    error_message: Option<&str>,
-) {
-    let palette = theme.palette;
-    let modal_bg = Color::Rgb(34, 38, 47);
-    let modal_fg = Color::Rgb(232, 236, 242);
-
-    let modal_area = centered_rect(90, 12, anchor_area);
-    f.render_widget(Clear, modal_area);
-    let modal_block = Block::default()
-        .title(" ngrok domain ")
-        .borders(Borders::ALL)
-        .border_type(palette.border_type)
-        .border_style(Style::default().fg(palette.border_fg))
-        .style(Style::default().bg(modal_bg));
-    f.render_widget(modal_block, modal_area);
-
-    let inner = Rect::new(
-        modal_area.x.saturating_add(1),
-        modal_area.y.saturating_add(1),
-        modal_area.width.saturating_sub(2),
-        modal_area.height.saturating_sub(2),
-    );
-    let content_area = inner.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-
-    let modal_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(content_area);
-
-    let step_style = Style::default()
-        .fg(palette.title_fg)
-        .bg(modal_bg)
-        .add_modifier(Modifier::BOLD);
-    let body_lines = vec![
-        Line::from(Span::styled("ngrok domain setup", step_style)),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter your ngrok static domain (e.g. my-app.ngrok-free.dev)",
-            step_style,
-        )),
-    ];
-    let body = Paragraph::new(body_lines)
-        .style(Style::default().fg(modal_fg).bg(modal_bg))
-        .wrap(Wrap { trim: false });
-    f.render_widget(body, modal_chunks[0]);
-
-    let input_line = if domain_value.is_empty() {
-        "_".to_string()
-    } else {
-        domain_value.to_string()
-    };
-    let input_widget = Paragraph::new(format!("  {input_line}"))
-        .style(Style::default().fg(palette.title_fg).bg(modal_bg))
-        .block(
-            Block::default()
-                .title(" NGROK_DOMAIN ")
-                .borders(Borders::ALL)
-                .border_type(palette.border_type)
-                .border_style(Style::default().fg(palette.border_fg))
-                .style(Style::default().bg(modal_bg)),
-        );
-    f.render_widget(input_widget, modal_chunks[1]);
-
-    let footer = if let Some(message) = error_message {
-        Paragraph::new(Line::from(Span::styled(
-            message.to_string(),
-            Style::default().fg(palette.danger_fg).bg(modal_bg),
-        )))
-    } else {
-        Paragraph::new(Line::from(Span::styled(
-            "[Enter] Save  [Esc] Quit  [Paste/Ctrl+V] Insert domain",
-            Style::default().fg(palette.muted_fg).bg(modal_bg),
-        )))
-    };
-    f.render_widget(footer, modal_chunks[2]);
-}
-
-fn masked_secret_preview(value: &str) -> String {
-    if value.is_empty() {
-        return String::new();
-    }
-    let chars: Vec<char> = value.chars().collect();
-    let visible = chars.len().min(4);
-    let masked_len = chars.len().saturating_sub(visible);
-    let mut preview = "*".repeat(masked_len);
-    preview.extend(chars[chars.len() - visible..].iter());
-    preview
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -2260,138 +1773,6 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && column < area.x.saturating_add(area.width)
         && row >= area.y
         && row < area.y.saturating_add(area.height)
-}
-
-fn ngrok_auth_setup_modal_area(anchor_area: Rect) -> Rect {
-    centered_rect(90, 15, anchor_area)
-}
-
-fn ngrok_auth_setup_content_area(anchor_area: Rect) -> Rect {
-    let modal_area = ngrok_auth_setup_modal_area(anchor_area);
-    let inner = Rect::new(
-        modal_area.x.saturating_add(1),
-        modal_area.y.saturating_add(1),
-        modal_area.width.saturating_sub(2),
-        modal_area.height.saturating_sub(2),
-    );
-    inner.inner(Margin {
-        horizontal: 2,
-        vertical: 1,
-    })
-}
-
-fn ngrok_auth_setup_copy_area(anchor_area: Rect) -> Rect {
-    let content_area = ngrok_auth_setup_content_area(anchor_area);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(content_area);
-    let body = chunks[0];
-    if body.height <= 2 {
-        return Rect::new(body.x, body.y, 0, 0);
-    }
-    Rect::new(body.x, body.y.saturating_add(2), body.width, 2)
-}
-
-fn draw_ngrok_auth_setup(
-    f: &mut Frame,
-    theme: &theme::ThemeDef,
-    anchor_area: Rect,
-    _config_path: &str,
-    masked_value: &str,
-    error_message: Option<&str>,
-) {
-    let palette = theme.palette;
-    let modal_bg = Color::Rgb(34, 38, 47);
-    let modal_fg = Color::Rgb(232, 236, 242);
-
-    let modal_area = ngrok_auth_setup_modal_area(anchor_area);
-    f.render_widget(Clear, modal_area);
-    let modal_block = Block::default()
-        .title(" ngrok auth ")
-        .borders(Borders::ALL)
-        .border_type(palette.border_type)
-        .border_style(Style::default().fg(palette.border_fg))
-        .style(Style::default().bg(modal_bg));
-    f.render_widget(modal_block, modal_area);
-    let content_area = ngrok_auth_setup_content_area(anchor_area);
-
-    let modal_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(content_area);
-
-    let link_style = Style::default()
-        .fg(palette.primary_fg)
-        .bg(modal_bg)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let step_style = Style::default()
-        .fg(palette.title_fg)
-        .bg(modal_bg)
-        .add_modifier(Modifier::BOLD);
-    let body_lines = vec![
-        Line::from(Span::styled("ngrok setup required", step_style)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("1. Open in browser and get your authtoken", step_style),
-            Span::raw(" "),
-            Span::styled(
-                "(click to copy)",
-                Style::default().fg(palette.secondary_fg).bg(modal_bg),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("   "),
-            Span::styled(NGROK_SETUP_URL, link_style),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "2. Paste the token or ngrok config command below",
-            step_style,
-        )),
-    ];
-    let body = Paragraph::new(body_lines)
-        .style(Style::default().fg(modal_fg).bg(modal_bg))
-        .wrap(Wrap { trim: false });
-    f.render_widget(body, modal_chunks[0]);
-
-    let input_line = if masked_value.is_empty() {
-        "_".to_string()
-    } else {
-        masked_value.to_string()
-    };
-    let input = Paragraph::new(format!("  {input_line}"))
-        .style(Style::default().fg(palette.title_fg).bg(modal_bg))
-        .block(
-            Block::default()
-                .title(" NGROK_AUTHTOKEN ")
-                .borders(Borders::ALL)
-                .border_type(palette.border_type)
-                .border_style(Style::default().fg(palette.border_fg))
-                .style(Style::default().bg(modal_bg)),
-        );
-    f.render_widget(input, modal_chunks[1]);
-
-    let footer = if let Some(message) = error_message {
-        Paragraph::new(Line::from(Span::styled(
-            message.to_string(),
-            Style::default().fg(palette.danger_fg).bg(modal_bg),
-        )))
-    } else {
-        Paragraph::new(Line::from(Span::styled(
-            "[Enter] Save  [Esc] Quit  [Paste/Ctrl+V] Insert token",
-            Style::default().fg(palette.muted_fg).bg(modal_bg),
-        )))
-    };
-    f.render_widget(footer, modal_chunks[2]);
 }
 
 fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u16)) {
@@ -2416,11 +1797,9 @@ mod tests {
     use super::state::{ToolMode, UiLanguage};
     use super::{
         LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_tui_header,
-        export_logs_to_dir, key_is_clipboard_paste, mask_mcp_path_in_log,
-        normalize_ngrok_authtoken_input, parse_terminal_profile_choice, text_input_key_is_cancel,
-        wrap_log_message,
+        export_logs_to_dir, mask_mcp_path_in_log, normalize_public_base_url_input,
+        parse_terminal_profile_choice, wrap_log_message,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -2482,42 +1861,16 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_plain_ngrok_token() {
+    fn normalizes_public_base_url() {
         assert_eq!(
-            normalize_ngrok_authtoken_input("  test-token-123  "),
-            "test-token-123"
+            normalize_public_base_url_input("  https://catdesk.example.com/  ").unwrap(),
+            "https://catdesk.example.com"
         );
     }
 
     #[test]
-    fn extracts_token_from_ngrok_command() {
-        assert_eq!(
-            normalize_ngrok_authtoken_input("ngrok config add-authtoken test-token-123"),
-            "test-token-123"
-        );
-    }
-
-    #[test]
-    fn detects_ctrl_v_as_clipboard_paste() {
-        assert!(key_is_clipboard_paste(&KeyEvent::new(
-            KeyCode::Char('v'),
-            KeyModifiers::CONTROL
-        )));
-    }
-
-    #[test]
-    fn detects_shift_insert_as_clipboard_paste() {
-        assert!(key_is_clipboard_paste(&KeyEvent::new(
-            KeyCode::Insert,
-            KeyModifiers::SHIFT
-        )));
-    }
-
-    #[test]
-    fn q_does_not_cancel_text_input() {
-        assert!(!text_input_key_is_cancel(KeyCode::Char('q')));
-        assert!(!text_input_key_is_cancel(KeyCode::Char('Q')));
-        assert!(text_input_key_is_cancel(KeyCode::Esc));
+    fn rejects_non_https_public_base_url() {
+        assert!(normalize_public_base_url_input("http://catdesk.example.com").is_err());
     }
 
     #[test]
@@ -2581,14 +1934,14 @@ mod tests {
             id: 1,
             time: "12:34:56".into(),
             level: "INFO",
-            message: "MCP Server URL: https://example.ngrok.app/secret/mcp".into(),
+            message: "MCP Server URL: https://catdesk.example.com/secret/mcp".into(),
         }];
 
         let path = export_logs_to_dir(&logs, &root).expect("export logs");
         let text = std::fs::read_to_string(&path).expect("read exported logs");
         assert!(text.contains("12:34:56 INFO"));
         assert!(text.contains(super::MCP_URL_MASK));
-        assert!(!text.contains("https://example.ngrok.app/secret/mcp"));
+        assert!(!text.contains("https://catdesk.example.com/secret/mcp"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2604,7 +1957,7 @@ mod tests {
                 draw_chatgpt_connector_refresh_notice(
                     frame,
                     &theme,
-                    Some("https://example.ngrok.app/secret/mcp"),
+                    Some("https://catdesk.example.com/secret/mcp"),
                     None,
                 )
             })
@@ -2633,7 +1986,7 @@ mod tests {
         assert!(text.contains("9. Click Create"));
         assert!(text.contains(super::MCP_URL_MASK));
         assert!(text.contains("Click to reveal"));
-        assert!(!text.contains("https://example.ngrok.app/secret/mcp"));
+        assert!(!text.contains("https://catdesk.example.com/secret/mcp"));
         assert!(!text.contains("[c]"));
         assert!(text.contains("I've re-added CatDesk"));
         assert!(text.contains("Remind me next launch"));
@@ -2644,7 +1997,7 @@ mod tests {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let theme = super::theme::all()[0];
-        let url = "https://example.ngrok.app/secret/mcp";
+        let url = "https://catdesk.example.com/secret/mcp";
 
         terminal
             .draw(|frame| {
@@ -2810,7 +2163,7 @@ async fn run_settings(
             usage_totals,
             set_catdesk_as_co_author,
             mcp_slug,
-            ngrok_domain,
+            public_base_url,
         ) = {
             let app = state.lock().await;
             (
@@ -2820,7 +2173,7 @@ async fn run_settings(
                 app.all_time_usage_totals(),
                 app.set_catdesk_as_co_author,
                 app.mcp_slug.clone(),
-                app.ngrok_domain.clone(),
+                app.public_base_url.clone(),
             )
         };
         terminal.draw(|f| {
@@ -2831,7 +2184,7 @@ async fn run_settings(
                 current_show_detail_mode,
                 set_catdesk_as_co_author,
                 &mcp_slug,
-                ngrok_domain.as_deref(),
+                public_base_url.as_deref(),
                 &usage_totals,
                 selected_row,
                 confirm_reset_token_billing,
@@ -2906,20 +2259,33 @@ async fn run_settings(
                                 app.log("INFO", "Generated new random MCP slug".into());
                                 app.persist_state_with_log();
                             } else if selected_row == detail_mode_end + 3 {
-                                let current_domain = app.ngrok_domain.clone().unwrap_or_default();
+                                let current_url = app.public_base_url.clone().unwrap_or_default();
                                 drop(app);
-                                if let Some(new_domain) = run_prompt(terminal, "Enter ngrok static domain (with/without https://, empty to clear):", &current_domain).await? {
-                                    let mut cleaned = new_domain.trim();
-                                    if let Some(stripped) = cleaned.strip_prefix("https://") {
-                                        cleaned = stripped;
-                                    } else if let Some(stripped) = cleaned.strip_prefix("http://") {
-                                        cleaned = stripped;
+                                if let Some(new_url) = run_prompt(
+                                    terminal,
+                                    "Enter public HTTPS base URL (empty to clear):",
+                                    &current_url,
+                                )
+                                .await?
+                                {
+                                    let trimmed = new_url.trim();
+                                    let normalized = if trimmed.is_empty() {
+                                        Ok(None)
+                                    } else {
+                                        normalize_public_base_url_input(trimmed).map(Some)
+                                    };
+                                    match normalized {
+                                        Ok(value) => {
+                                            save_public_base_url(value.as_deref())?;
+                                            let mut app = state.lock().await;
+                                            app.public_base_url = value;
+                                            app.log("INFO", "Updated public base URL".into());
+                                            app.persist_state_with_log();
+                                        }
+                                        Err(error) => {
+                                            state.lock().await.log("WARN", error);
+                                        }
                                     }
-                                    cleaned = cleaned.trim_end_matches('/');
-                                    let mut app = state.lock().await;
-                                    app.ngrok_domain = if cleaned.is_empty() { None } else { Some(cleaned.to_string()) };
-                                    app.log("INFO", "Updated ngrok static domain".into());
-                                    app.persist_state_with_log();
                                 }
                             }
                         }
@@ -2951,7 +2317,7 @@ fn draw_settings(
     current_show_detail_mode: ShowDetailMode,
     set_catdesk_as_co_author: bool,
     mcp_slug: &str,
-    ngrok_domain: Option<&str>,
+    public_base_url: Option<&str>,
     usage_totals: &UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
@@ -3167,10 +2533,10 @@ fn draw_settings(
         Style::default().fg(palette.primary_fg)
     };
 
-    let domain_row = co_author_row + 3;
-    let domain_selected = domain_row == selected_row;
-    let domain_marker = if domain_selected { ">" } else { " " };
-    let domain_name_style = if domain_selected {
+    let public_url_row = co_author_row + 3;
+    let public_url_selected = public_url_row == selected_row;
+    let public_url_marker = if public_url_selected { ">" } else { " " };
+    let public_url_name_style = if public_url_selected {
         Style::default()
             .fg(palette.key_fg)
             .add_modifier(Modifier::BOLD)
@@ -3214,22 +2580,22 @@ fn draw_settings(
         ),
         slug_new_name_style,
     )]));
-    if domain_selected {
+    if public_url_selected {
         selected_line_idx = lines.len();
     }
     lines.push(Line::from(vec![Span::styled(
         format!(
-            " {} [{}] Set ngrok static domain",
-            domain_marker,
-            domain_row + 1
+            " {} [{}] Set public base URL",
+            public_url_marker,
+            public_url_row + 1
         ),
-        domain_name_style,
+        public_url_name_style,
     )]));
     lines.push(Line::from(vec![
         Span::styled("     ", Style::default()),
         Span::styled(
-            if let Some(domain) = ngrok_domain {
-                format!("[{}]", domain)
+            if let Some(url) = public_base_url {
+                format!("[{}]", url)
             } else {
                 "[not set]".to_string()
             },
@@ -3237,7 +2603,7 @@ fn draw_settings(
         ),
     ]));
     lines.push(Line::from(vec![Span::styled(
-        "     Pro tip: Your permanent ngrok-free.dev domain is auto-saved above.",
+        "     Configure cloudflared separately to forward this hostname to http://127.0.0.1:3200.",
         Style::default().fg(palette.muted_fg),
     )]));
     lines.push(Line::from(""));
@@ -4017,9 +3383,11 @@ async fn start_services(
         app.log("INFO", format!("MCP Server started on port {port}"));
     }
 
-    // Start ngrok
-    if let Err(e) = ngrok::start(state.clone()).await {
-        state.lock().await.log("ERROR", format!("ngrok: {e}"));
+    {
+        let mut app = state.lock().await;
+        if let Some(url) = app.public_mcp_url() {
+            app.log("INFO", format!("MCP Server URL: {url}"));
+        }
     }
 
     devtools_bridge
@@ -4264,15 +3632,12 @@ async fn run_tui(
                                                 let now = Instant::now();
                                                 log_secret_revealed_until
                                                     .insert(*log_id, now + MCP_URL_REVEAL_DURATION);
-                                                let reveal_message = if message
-                                                    .starts_with("Auto-saved ngrok static domain: ")
-                                                {
-                                                    "Domain revealed for 10s"
-                                                } else if post_mcp_path(message).is_some() {
-                                                    "MCP path revealed for 10s"
-                                                } else {
-                                                    "URL revealed for 10s"
-                                                };
+                                                let reveal_message =
+                                                    if post_mcp_path(message).is_some() {
+                                                        "MCP path revealed for 10s"
+                                                    } else {
+                                                        "URL revealed for 10s"
+                                                    };
                                                 toast = Some((
                                                     reveal_message,
                                                     (mouse.column, mouse.row),
@@ -4387,7 +3752,7 @@ fn draw_ui(
         .unwrap_or_default()
         .as_millis();
 
-    let has_url = app.ngrok_url.is_some();
+    let has_url = app.public_base_url.is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -4426,11 +3791,6 @@ fn draw_ui(
         format!("RUNNING (port {})", app.port)
     } else {
         "STOPPED".into()
-    };
-    let ngrok_status: &str = if app.ngrok_running {
-        "RUNNING"
-    } else {
-        "STOPPED"
     };
     let devtools_status: &str = if app.devtools_running {
         "RUNNING"
@@ -4542,17 +3902,6 @@ fn draw_ui(
             Span::styled(
                 &server_status,
                 Style::default().fg(if app.server_running {
-                    palette.success_fg
-                } else {
-                    palette.danger_fg
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            status_label("ngrok"),
-            Span::styled(
-                ngrok_status,
-                Style::default().fg(if app.ngrok_running {
                     palette.success_fg
                 } else {
                     palette.danger_fg
@@ -4741,7 +4090,7 @@ fn draw_ui(
                 let closing = flow.closing_started_ms.is_some();
                 let lane_active = closing
                     || !flow.anim_queue.is_empty()
-                    || (app.server_running && app.ngrok_running && app.remote_connected);
+                    || (app.server_running && app.remote_connected);
                 let lane = lane_for(lane_active, Some(flow));
                 let mut row = vec![
                     Span::styled("    ", Style::default().fg(palette.muted_fg)),

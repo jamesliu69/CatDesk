@@ -112,9 +112,26 @@ ChatGPT Web + CatDesk
 
    CatDesk 啟動後，可以選擇 `Control Computer`、`Control Browser` 或 `Both`。在模式選擇畫面按 `l` 可以在 English 與繁體中文之間切換；語言偏好會儲存在 `~/.catdesk/config.toml`。如果啟用了瀏覽器控制，請選擇一個支援的 Chromium 瀏覽器。在 macOS 上，除了 `PATH` 中的 binary，CatDesk 也會偵測 `/Applications` 與 `~/Applications` 裡的標準瀏覽器 App bundle。
 
-   第一次啟動時，CatDesk 會要求你輸入 **ngrok authtoken** 和 **ngrok static domain**（例如 `my-app.ngrok-free.dev`）。這兩項都可以從 [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup) 取得，並會儲存在 `~/.catdesk/config.toml`，之後啟動時自動重用。
+   CatDesk 不再自行啟動或管理 Tunnel。請先設定外部 HTTPS Tunnel，第一次啟動時再輸入它的公開 Base URL（例如 `https://catdesk.example.com`）。這個 URL 會儲存在 `~/.catdesk/config.toml`，之後啟動時自動重用。建議使用 Cloudflare Tunnel。
 
-   CatDesk 預設監聽 `3200` port。可以用 `PORT` 覆寫。Workspace root 預設為你啟動 CatDesk 時所在的目錄，也可以用 `WORKSPACE_ROOT` 覆寫。
+   Cloudflare Tunnel 可以把公開 hostname 轉送到 CatDesk，而且不需要開放 inbound port。Linux / Raspberry Pi 範例：
+
+   ```yaml
+   # ~/.cloudflared/config.yml
+   tunnel: <TUNNEL-UUID>
+   credentials-file: /home/<USER>/.cloudflared/<TUNNEL-UUID>.json
+   url: http://127.0.0.1:3200
+   ```
+
+   ```bash
+   cloudflared tunnel route dns <TUNNEL-UUID-OR-NAME> catdesk.example.com
+   sudo cloudflared --config /home/<USER>/.cloudflared/config.yml service install
+   sudo systemctl start cloudflared
+   ```
+
+   CatDesk 只負責本機 MCP Server 與 Public Base URL；Tunnel 連線與自動重啟交給 `cloudflared`。
+
+   CatDesk 預設只監聽 `127.0.0.1:3200`。可以用 `PORT` 覆寫 port。Workspace root 預設為你啟動 CatDesk 時所在的目錄，也可以用 `WORKSPACE_ROOT` 覆寫。
 
    第一次從 macOS Terminal.app 啟動時，CatDesk 會詢問你是否要使用專用的 `CatDesk` Terminal profile，並把選擇儲存在 `~/.catdesk/config.toml`。如果啟用，而且目前分頁尚未使用該 profile，CatDesk 會套用它、關閉暫時建立的 helper window，並要求你在該分頁再次執行相同指令。之後啟動時會直接重用已儲存的偏好。設定 `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` 可以暫時保留目前的 Terminal session，不論已儲存的偏好為何。
 
@@ -186,7 +203,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 | MCP protocolVersion | `2026-07-28` |
 | Server | Axum + Tokio |
 | TUI | Ratatui |
-| Tunnel | ngrok |
+| 公開連線 | 外部 HTTPS Tunnel（建議 Cloudflare Tunnel） |
 | 瀏覽器控制 | chrome-devtools-mcp |
 | Widget | HTML + JavaScript |
 | 發布方式 | npm |
@@ -242,7 +259,7 @@ CatDesk 有兩種本機工具模式：`multi-tools` 提供 10 個工具，`read-
   </tr>
 </table>
 
-可以。開啟 [Advanced connector settings](https://chatgpt.com/#settings/Connectors/Advanced)，然後啟用 `Enforce CSP in developer mode`。這個設定會移除紅色按鈕。CatDesk 會自動把目前的 ngrok domain 加進 widget CSP，因此開啟 CSP enforcement 後 widget 應該仍能正常運作。
+可以。開啟 [Advanced connector settings](https://chatgpt.com/#settings/Connectors/Advanced)，然後啟用 `Enforce CSP in developer mode`。這個設定會移除紅色按鈕。CatDesk 會自動把目前設定的 Public Base URL origin 加進 widget CSP，因此開啟 CSP enforcement 後 widget 應該仍能正常運作。
 
 ## 我明明已經連過了，為什麼還一直叫我重新 Connect？
 
@@ -331,17 +348,17 @@ URL 由以下部分組成：
 
 | 部分         | 範例                          | 意義                           |
 | ------------ | ----------------------------- | ------------------------------ |
-| Public URL   | `https://xxxx.ngrok-free.dev` | 你的 ngrok static domain       |
+| Public URL   | `https://catdesk.example.com`  | 你的外部 HTTPS Tunnel hostname |
 | Random path  | `/Ab3kL9xQ2pTm7VhC`           | 第一次啟動時隨機產生的路徑     |
 | MCP endpoint | `/mcp`                        | 真正的 MCP endpoint            |
 
 因此完整 URL 會長這樣：
 
 ```text
-https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
+https://catdesk.example.com/Ab3kL9xQ2pTm7VhC/mcp
 ```
 
-Static domain 和 random path 都會儲存在 `~/.catdesk/config.toml`，所以完整 MCP URL 在每次啟動後都會保持不變。Connector 只需要設定一次。
+Public Base URL 和 random path 都會儲存在 `~/.catdesk/config.toml`。只要外部 Tunnel hostname 不變，完整 MCP URL 在每次啟動後都會保持不變，Connector 只需要設定一次。
 
 # 關於 Binagotchy
 

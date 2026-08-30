@@ -5832,9 +5832,6 @@
           return window.fetch(requestUrl, {
             method: "GET",
             cache: "no-store",
-            headers: {
-              "ngrok-skip-browser-warning": "1",
-            },
           }).then(function (response) {
             return response
               .json()
@@ -5871,7 +5868,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "mode=" + encodeURIComponent(mode),
             })
@@ -6128,7 +6124,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "layout=" + encodeURIComponent(layout),
             })
@@ -6371,7 +6366,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "mode=" + encodeURIComponent(mode),
             })
@@ -6626,7 +6620,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "seed=" + encodeURIComponent(seed),
             })
@@ -6669,9 +6662,6 @@
           window
             .fetch(url, {
               method: "DELETE",
-              headers: {
-                "ngrok-skip-browser-warning": "1",
-              },
             })
             .then(function (response) {
               if (!response.ok) {
@@ -6713,9 +6703,6 @@
           window
             .fetch(url, {
               method: "POST",
-              headers: {
-                "ngrok-skip-browser-warning": "1",
-              },
             })
             .then(function (response) {
               if (!response.ok) {

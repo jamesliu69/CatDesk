@@ -233,9 +233,8 @@ impl UiLanguage {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
-    pub ngrok_authtoken: Option<String>,
+    pub public_base_url: Option<String>,
     pub mcp_slug: Option<String>,
-    pub ngrok_domain: Option<String>,
     #[serde(default)]
     pub last_started_version: Option<String>,
     #[serde(default)]
@@ -265,9 +264,8 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            ngrok_authtoken: None,
+            public_base_url: None,
             mcp_slug: None,
-            ngrok_domain: None,
             last_started_version: None,
             chatgpt_connector_revision: None,
             agents_path_mode: AgentsPathMode::Default,
@@ -288,15 +286,10 @@ impl Default for AppConfig {
 
 impl AppConfig {
     fn normalized(mut self) -> Self {
-        self.ngrok_authtoken = self
-            .ngrok_authtoken
+        self.public_base_url = self
+            .public_base_url
             .take()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        self.ngrok_domain = self
-            .ngrok_domain
-            .take()
-            .map(|value| value.trim().to_string())
+            .map(|value| value.trim().trim_end_matches('/').to_string())
             .filter(|value| !value.is_empty());
         self.partner_binagotchy_seed = self
             .partner_binagotchy_seed
@@ -504,7 +497,7 @@ impl ToolMode {
     }
 }
 
-/// Shared application state across server, ngrok, and TUI.
+/// Shared application state across server and TUI.
 pub struct AppState {
     pub theme: String,
     pub mode: Mode,
@@ -512,13 +505,11 @@ pub struct AppState {
     pub show_detail_mode: ShowDetailMode,
     pub ui_language: UiLanguage,
     pub mcp_slug: String,
-    pub ngrok_domain: Option<String>,
+    pub public_base_url: Option<String>,
     pub is_returning_user: bool,
     pub chatgpt_connector_refresh_required: bool,
     pub chatgpt_connector_revision: Option<u32>,
     pub server_running: bool,
-    pub ngrok_running: bool,
-    pub ngrok_url: Option<String>,
     pub remote_connected: bool,
     pub last_remote_activity_ms: Option<u128>,
     pub devtools_running: bool,
@@ -540,7 +531,6 @@ pub struct AppState {
     pub command_jobs: CommandJobManager,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
-    pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
     pub remote_browser_child: Option<tokio::process::Child>,
     pub devtools_child: Option<tokio::process::Child>,
 }
@@ -605,26 +595,14 @@ pub fn load_app_config() -> std::io::Result<AppConfig> {
     AppConfig::load_from_path(&app_config_path()?)
 }
 
-pub fn load_ngrok_authtoken() -> std::io::Result<Option<String>> {
-    Ok(load_app_config()?.ngrok_authtoken)
+pub fn load_public_base_url() -> std::io::Result<Option<String>> {
+    Ok(load_app_config()?.public_base_url)
 }
 
-pub fn save_ngrok_authtoken(token: &str) -> std::io::Result<PathBuf> {
+pub fn save_public_base_url(url: Option<&str>) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
     let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_authtoken = Some(token.to_string());
-    config.save_to_path(&path)?;
-    Ok(path)
-}
-
-pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
-    Ok(load_app_config()?.ngrok_domain)
-}
-
-pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_domain = Some(domain.to_string());
+    config.public_base_url = url.map(str::to_string);
     config.save_to_path(&path)?;
     Ok(path)
 }
@@ -862,7 +840,7 @@ impl AppState {
         if partner_binagotchy_seed.is_none() {
             mascot::archive_startup_mascot(mascot_seed)?;
         }
-        let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
+        let is_returning_user = config.mcp_slug.is_some() && config.public_base_url.is_some();
         let stored_connector_revision = config.chatgpt_connector_revision;
         let chatgpt_connector_refresh_required = is_returning_user
             && stored_connector_revision.unwrap_or(0) < CURRENT_CHATGPT_CONNECTOR_REVISION;
@@ -883,13 +861,11 @@ impl AppState {
             show_detail_mode: config.show_detail_mode,
             ui_language: config.ui_language,
             mcp_slug,
-            ngrok_domain: config.ngrok_domain.clone(),
+            public_base_url: config.public_base_url.clone(),
             is_returning_user,
             chatgpt_connector_refresh_required,
             chatgpt_connector_revision,
             server_running: false,
-            ngrok_running: false,
-            ngrok_url: None,
             remote_connected: false,
             last_remote_activity_ms: None,
             devtools_running: false,
@@ -911,7 +887,6 @@ impl AppState {
             command_jobs: CommandJobManager::new(),
             config_path,
             server_handle: None,
-            ngrok_task: None,
             remote_browser_child: None,
             devtools_child: None,
         })
@@ -926,7 +901,7 @@ impl AppState {
     }
 
     pub fn public_mcp_url(&self) -> Option<String> {
-        self.ngrok_url
+        self.public_base_url
             .as_ref()
             .map(|url| format!("{url}{}", self.mcp_path()))
     }
@@ -949,7 +924,7 @@ impl AppState {
     fn app_config(&self) -> std::io::Result<AppConfig> {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
         config.mcp_slug = Some(self.mcp_slug.clone());
-        config.ngrok_domain = self.ngrok_domain.clone();
+        config.public_base_url = self.public_base_url.clone();
         config.last_started_version = Some(env!("CARGO_PKG_VERSION").to_string());
         config.chatgpt_connector_revision = self.chatgpt_connector_revision;
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
@@ -1358,7 +1333,7 @@ mod tests {
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
         AppConfig {
             mcp_slug: Some("existing-secret-slug".into()),
-            ngrok_domain: Some("catdesk-example.ngrok.app".into()),
+            public_base_url: Some("https://catdesk.example.com".into()),
             ..AppConfig::default()
         }
         .save_to_path(&config_path)
@@ -1408,7 +1383,7 @@ mod tests {
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
         AppConfig {
             mcp_slug: Some("existing-secret-slug".into()),
-            ngrok_domain: Some("catdesk-example.ngrok.app".into()),
+            public_base_url: Some("https://catdesk.example.com".into()),
             chatgpt_connector_revision: Some(CURRENT_CHATGPT_CONNECTOR_REVISION),
             ..AppConfig::default()
         }
@@ -1574,23 +1549,58 @@ toolCallCount = 1
     }
 
     #[test]
-    fn app_config_round_trips_ngrok_authtoken() {
+    fn app_config_round_trips_public_base_url() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-token-{unique}"));
+        let workspace = std::env::temp_dir().join(format!("catdesk-config-public-url-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp config dir");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
 
         let config = AppConfig {
-            ngrok_authtoken: Some("test-token-123".into()),
+            public_base_url: Some(" https://catdesk.example.com/ ".into()),
             ..AppConfig::default()
         };
         config.save_to_path(&config_path).expect("save config");
 
         let saved = AppConfig::load_from_path(&config_path).expect("load config");
-        assert_eq!(saved.ngrok_authtoken.as_deref(), Some("test-token-123"));
+        assert_eq!(
+            saved.public_base_url.as_deref(),
+            Some("https://catdesk.example.com")
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
+    fn public_mcp_url_uses_configured_public_base_url_and_secret_slug() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-public-mcp-url-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp config dir");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+
+        let config = AppConfig {
+            public_base_url: Some("https://catdesk.example.com".into()),
+            mcp_slug: Some("secret-slug".into()),
+            ..AppConfig::default()
+        };
+        config.save_to_path(&config_path).expect("save config");
+
+        let app = AppState::from_config_path(
+            3200,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        assert_eq!(
+            app.public_mcp_url().as_deref(),
+            Some("https://catdesk.example.com/secret-slug/mcp")
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);

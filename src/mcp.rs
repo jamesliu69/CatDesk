@@ -6390,7 +6390,7 @@ hello world"
         for mode in [ShowDetailMode::Expanded, ShowDetailMode::Collapsed] {
             let list_response = handle_resources_list_with_show_detail_mode(
                 &resources_list_request(),
-                Some("https://example.ngrok.app"),
+                Some("https://catdesk.example.com"),
                 mode,
             );
             assert_eq!(
@@ -6405,7 +6405,7 @@ hello world"
 
             let read_response = handle_resources_read_with_show_detail_mode(
                 &resources_read_request(UI_TEMPLATE_URI),
-                Some("https://example.ngrok.app"),
+                Some("https://catdesk.example.com"),
                 1,
                 mode,
             );
@@ -6415,7 +6415,7 @@ hello world"
 
         let list_response = handle_resources_list_with_show_detail_mode(
             &resources_list_request(),
-            Some("https://example.ngrok.app"),
+            Some("https://catdesk.example.com"),
             ShowDetailMode::Disable,
         );
         assert_eq!(
@@ -6430,7 +6430,7 @@ hello world"
 
         let read_response = handle_resources_read_with_show_detail_mode(
             &resources_read_request(UI_TEMPLATE_URI),
-            Some("https://example.ngrok.app"),
+            Some("https://catdesk.example.com"),
             1,
             ShowDetailMode::Disable,
         );
@@ -6451,7 +6451,7 @@ hello world"
     fn resources_read_includes_widget_csp_connect_domains() {
         let resource_resp = handle_resources_read(
             &resources_read_request(UI_TEMPLATE_URI),
-            Some("https://example.ngrok.app"),
+            Some("https://catdesk.example.com"),
             1,
         );
         let ui_meta = resource_resp
@@ -6497,7 +6497,7 @@ hello world"
                 .and_then(Value::as_array)
                 .and_then(|domains| domains.first())
                 .and_then(Value::as_str),
-            Some("https://example.ngrok.app")
+            Some("https://catdesk.example.com")
         );
         assert_eq!(
             ui_meta

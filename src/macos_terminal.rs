@@ -61,6 +61,13 @@ pub enum LaunchAction {
     ExitAfterProfileBootstrap,
 }
 
+fn prompt_for_terminal_profile(
+    _input: &mut impl std::io::BufRead,
+    _output: &mut impl std::io::Write,
+) -> std::io::Result<bool> {
+    Ok(true)
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn ttyname(fd: c_int) -> *const c_char;
@@ -550,5 +557,21 @@ fn profile_font_antialias_plist() -> &'static str {
         "true"
     } else {
         "false"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, ErrorKind};
+
+    #[test]
+    fn eof_does_not_enable_terminal_profile() {
+        let mut input = Cursor::new([]);
+        let mut output = Vec::new();
+
+        let error = prompt_for_terminal_profile(&mut input, &mut output).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
     }
 }

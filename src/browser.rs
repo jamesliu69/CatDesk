@@ -333,6 +333,13 @@ fn find_active_remote_debug_for_binary(
 }
 
 fn process_matches_binary(process: &ProcessInfo, binary: &str, resolved_path: &str) -> bool {
+    if process
+        .cmdline
+        .iter()
+        .any(|arg| arg.starts_with("--type="))
+    {
+        return false;
+    }
     process
         .cmdline
         .iter()
@@ -344,12 +351,9 @@ fn command_line_starts_with_executable(command_line: &str, executable: &str) -> 
     if command_line == executable {
         return true;
     }
-    command_line
-        .strip_prefix(executable)
-        .is_some_and(|rest| {
-            rest.chars().next().is_some_and(char::is_whitespace)
-                && rest.trim_start().starts_with('-')
-        })
+    command_line.strip_prefix(executable).is_some_and(|rest| {
+        rest.chars().next().is_some_and(char::is_whitespace)
+    })
 }
 
 fn command_matches_binary(arg: &str, binary: &str) -> bool {
@@ -506,8 +510,39 @@ mod tests {
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         ));
         assert!(!command_line_starts_with_executable(
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper --flag",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome--wrapper --flag",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         ));
+    }
+
+    #[test]
+    fn executable_prefix_allows_positional_argument() {
+        assert!(command_line_starts_with_executable(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome https://example.com --remote-debugging-port=9222",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        ));
+    }
+
+    #[test]
+    fn helper_process_is_not_detected_as_main_browser() {
+        let executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+        let process = ProcessInfo {
+            pid: 4242,
+            cmdline: vec![
+                "/Applications/Google".into(),
+                "Chrome.app/Contents/MacOS/Google".into(),
+                "Chrome".into(),
+                "Helper".into(),
+                "--type=renderer".into(),
+                "--remote-debugging-port=9222".into(),
+            ],
+            command_line: format!(
+                "{executable} Helper --type=renderer --remote-debugging-port=9222"
+            ),
+        };
+
+        assert!(
+            find_active_remote_debug_for_binary("google-chrome", executable, &[process]).is_none()
+        );
     }
 }
