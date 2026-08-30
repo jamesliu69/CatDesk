@@ -19,8 +19,8 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::state::{
-    AgentsPathMode, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode, TokenStatsLayout,
-    UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
+    AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
+    TokenStatsLayout, UsageTotals, parse_seed_hex, save_agents_path_mode, save_show_detail_mode,
     save_token_stats_layout,
 };
 
@@ -383,10 +383,18 @@ fn flow_file_name(path: &str) -> Option<String> {
 }
 
 fn flow_argument_summary(tool: &str, arguments: &serde_json::Map<String, Value>) -> Option<String> {
+    if tool == "read" {
+        let paths = arguments.get("paths")?.as_array()?;
+        let first = flow_file_name(paths.first()?.as_str()?)?;
+        return Some(match paths.len() {
+            1 => first,
+            count => format!("{first} +{}", count - 1),
+        });
+    }
     let (key, file_name_only) = match tool {
         "run_command" | "start_command" => ("command", false),
         "poll_command" | "cancel_command" => ("job_id", false),
-        "read" | "write" | "edit" | "delete" => ("path", true),
+        "write" | "edit" | "delete" => ("path", true),
         "search" => ("pattern", false),
         _ => return None,
     };
@@ -424,6 +432,39 @@ fn resource_read_flow_label(req: &Value) -> String {
         return format!("resources/read:{tool_name}");
     }
     "resources/read:base".to_string()
+}
+
+fn bootstrap_widgets_from_tools_list_response(response: &Value) -> Vec<FlowBootstrapWidget> {
+    let Some(tools) = response
+        .get("result")
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let tool_name = tool.get("name").and_then(Value::as_str)?;
+            let uri = tool
+                .get("_meta")
+                .and_then(|meta| meta.get("openai/outputTemplate"))
+                .and_then(Value::as_str)?;
+            if !mcp::is_catdesk_widget_resource_uri(uri) {
+                return None;
+            }
+            Some(FlowBootstrapWidget {
+                uri: uri.to_string(),
+                tool_name: tool_name.to_string(),
+                label: if tool_name == "catdesk_instruction" {
+                    "instruction".to_string()
+                } else {
+                    tool_name.to_string()
+                },
+            })
+        })
+        .collect()
 }
 
 fn request_flow_label(req: &Value) -> String {
@@ -1280,7 +1321,7 @@ mod tests {
             "method": "tools/call",
             "params": {
                 "name": "read",
-                "arguments": { "path": "src/widget/catdesk_dashboard.html" }
+                "arguments": { "paths": ["src/widget/catdesk_dashboard.html"] }
             }
         });
         assert_eq!(
@@ -1391,6 +1432,42 @@ mod tests {
             summarize_response(&resource_request, &resource_response),
             "resources/read id=2 ok tool=run_command contents=1 textChars=5"
         );
+    }
+
+    #[test]
+    fn bootstrap_widget_discovery_uses_catdesk_output_templates_only() {
+        let response = json!({
+            "result": {
+                "tools": [
+                    {
+                        "name": "read",
+                        "_meta": {
+                            "openai/outputTemplate": "ui://widget/catdesk-dashboard.html?widgetRevision=2&toolName=read"
+                        }
+                    },
+                    {
+                        "name": "catdesk_instruction",
+                        "_meta": {
+                            "openai/outputTemplate": "ui://widget/catdesk-dashboard.html?widgetRevision=2&toolName=catdesk_instruction"
+                        }
+                    },
+                    {
+                        "name": "browser_tool",
+                        "_meta": {
+                            "openai/outputTemplate": "ui://other/widget.html"
+                        }
+                    },
+                    { "name": "plain_tool" }
+                ]
+            }
+        });
+
+        let widgets = bootstrap_widgets_from_tools_list_response(&response);
+        assert_eq!(widgets.len(), 2);
+        assert_eq!(widgets[0].tool_name, "read");
+        assert_eq!(widgets[0].label, "read");
+        assert_eq!(widgets[1].tool_name, "catdesk_instruction");
+        assert_eq!(widgets[1].label, "instruction");
     }
 
     #[test]
@@ -1561,6 +1638,133 @@ mod tests {
                 mcp::MODERN_MCP_PROTOCOL_VERSION
             )
         );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn post_mcp_reports_runtime_widget_set_from_tools_list() {
+        let workspace_root = unique_temp_path("catdesk-bootstrap-tools-workspace");
+        let config_root = unique_temp_path("catdesk-bootstrap-tools-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+        };
+
+        let response = post_mcp(
+            State(server_state),
+            mcp_request_body("tools/list", json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut tracked = None;
+        while let Ok(event) = ui_rx.try_recv() {
+            if let ServerUiEvent::RecordBootstrapToolsListResponse {
+                success, widgets, ..
+            } = event
+            {
+                tracked = Some((success, widgets));
+            }
+        }
+        let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
+        assert!(success);
+        assert_eq!(widgets.len(), 10);
+        assert_eq!(
+            widgets
+                .iter()
+                .map(|widget| widget.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "run_command",
+                "start_command",
+                "poll_command",
+                "cancel_command",
+                "catdesk_instruction",
+                "read",
+                "search",
+                "write",
+                "edit",
+                "delete",
+            ]
+        );
+        assert!(widgets.iter().all(|widget| {
+            widget.uri.contains("ui://widget/catdesk-dashboard.html")
+                && widget
+                    .uri
+                    .contains(&format!("toolName={}", widget.tool_name))
+        }));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn post_mcp_tracks_widget_read_by_tool_name_across_uri_variations() {
+        let workspace_root = unique_temp_path("catdesk-bootstrap-read-workspace");
+        let config_root = unique_temp_path("catdesk-bootstrap-read-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            catdesk_instruction_called: Arc::new(AtomicBool::new(true)),
+        };
+
+        let response = post_mcp(
+            State(server_state),
+            mcp_request_body(
+                "resources/read",
+                json!({
+                    "uri": "ui://widget/catdesk-dashboard.html?widgetRevision=999&tokenStatsLayout=bottom&toolName=read"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut tracked = None;
+        while let Ok(event) = ui_rx.try_recv() {
+            if let ServerUiEvent::RecordBootstrapWidgetReadResponse {
+                tool_name, success, ..
+            } = event
+            {
+                tracked = Some((tool_name, success));
+            }
+        }
+        let (tool_name, success) = tracked.expect("missing bootstrap resources/read event");
+        assert!(success);
+        assert_eq!(tool_name, "read");
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -1876,6 +2080,20 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn flow_argument_summary_labels_batched_reads() {
+        let one = json!({ "paths": ["src/config.py"] });
+        let many = json!({ "paths": ["src/config.py", "src/loader.py", "src/errors.py"] });
+        assert_eq!(
+            flow_argument_summary("read", one.as_object().unwrap()).as_deref(),
+            Some("config.py")
+        );
+        assert_eq!(
+            flow_argument_summary("read", many.as_object().unwrap()).as_deref(),
+            Some("config.py +2")
+        );
     }
 
     #[test]
@@ -2301,7 +2519,7 @@ mod tests {
 
         let blocked_response = post_mcp(
             State(server_state.clone()),
-            tool_call_body("read", json!({ "path": "hello.txt" })),
+            tool_call_body("read", json!({ "paths": ["hello.txt"] })),
         )
         .await;
         assert_eq!(blocked_response.status(), StatusCode::OK);
@@ -2357,7 +2575,7 @@ mod tests {
 
         let allowed_response = post_mcp(
             State(server_state),
-            tool_call_body("read", json!({ "path": "hello.txt" })),
+            tool_call_body("read", json!({ "paths": ["hello.txt"] })),
         )
         .await;
         assert_eq!(allowed_response.status(), StatusCode::OK);
@@ -2370,7 +2588,7 @@ mod tests {
             allowed_payload
                 .get("result")
                 .and_then(|result| result.get("structuredContent"))
-                .and_then(|structured| structured.get("text"))
+                .and_then(|structured| structured.pointer("/files/0/text"))
                 .and_then(Value::as_str),
             Some("hello world\n")
         );
@@ -2447,7 +2665,7 @@ mod tests {
 
         let blocked = post_mcp_json_with_show_detail_mode(
             &server_state,
-            tool_call_body("read", json!({ "path": "hello.txt" })),
+            tool_call_body("read", json!({ "paths": ["hello.txt"] })),
             ShowDetailMode::Disable,
         )
         .await;
@@ -2492,7 +2710,7 @@ mod tests {
 
         let allowed = post_mcp_json_with_show_detail_mode(
             &server_state,
-            tool_call_body("read", json!({ "path": "hello.txt" })),
+            tool_call_body("read", json!({ "paths": ["hello.txt"] })),
             ShowDetailMode::Disable,
         )
         .await;
@@ -2500,7 +2718,7 @@ mod tests {
             allowed
                 .get("result")
                 .and_then(|result| result.get("structuredContent"))
-                .and_then(|structured| structured.get("text"))
+                .and_then(|structured| structured.pointer("/files/0/text"))
                 .and_then(Value::as_str),
             Some("hello world\n")
         );
@@ -2831,6 +3049,49 @@ async fn post_mcp_inner(
     }
 
     if req.id.is_some() {
+        let response_succeeded = response_json
+            .as_ref()
+            .is_some_and(|response| response.get("error").is_none());
+        match req.method.as_str() {
+            "server/discover" => {
+                let _ = s
+                    .ui_events
+                    .send(ServerUiEvent::RecordBootstrapDiscoverResponse {
+                        flow_id: STATELESS_FLOW_ID.to_string(),
+                        success: response_succeeded,
+                    });
+            }
+            "tools/list" => {
+                let widgets = response_json
+                    .as_ref()
+                    .map(bootstrap_widgets_from_tools_list_response)
+                    .unwrap_or_default();
+                let _ = s
+                    .ui_events
+                    .send(ServerUiEvent::RecordBootstrapToolsListResponse {
+                        flow_id: STATELESS_FLOW_ID.to_string(),
+                        success: response_succeeded,
+                        widgets,
+                    });
+            }
+            "resources/read" => {
+                if let Some(tool_name) = request_resource_uri(&body)
+                    .filter(|uri| mcp::is_catdesk_widget_resource_uri(uri))
+                    .and_then(|uri| query_param_value(uri, "toolName"))
+                    .filter(|tool_name| !tool_name.is_empty())
+                {
+                    let _ = s
+                        .ui_events
+                        .send(ServerUiEvent::RecordBootstrapWidgetReadResponse {
+                            flow_id: STATELESS_FLOW_ID.to_string(),
+                            tool_name: tool_name.to_string(),
+                            success: response_succeeded,
+                        });
+                }
+            }
+            _ => {}
+        }
+
         let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
             flow_id: STATELESS_FLOW_ID.to_string(),
             events: vec![request_flow_event.clone()],
