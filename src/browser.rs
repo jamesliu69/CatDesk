@@ -333,11 +333,7 @@ fn find_active_remote_debug_for_binary(
 }
 
 fn process_matches_binary(process: &ProcessInfo, binary: &str, resolved_path: &str) -> bool {
-    if process
-        .cmdline
-        .iter()
-        .any(|arg| arg.starts_with("--type="))
-    {
+    if process.cmdline.iter().any(|arg| arg.starts_with("--type=")) {
         return false;
     }
     process
@@ -351,9 +347,9 @@ fn command_line_starts_with_executable(command_line: &str, executable: &str) -> 
     if command_line == executable {
         return true;
     }
-    command_line.strip_prefix(executable).is_some_and(|rest| {
-        rest.chars().next().is_some_and(char::is_whitespace)
-    })
+    command_line
+        .strip_prefix(executable)
+        .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
 }
 
 fn command_matches_binary(arg: &str, binary: &str) -> bool {

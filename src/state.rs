@@ -631,10 +631,12 @@ pub fn save_show_detail_mode(mode: ShowDetailMode) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(target_os = "macos")]
 pub fn load_macos_terminal_profile() -> std::io::Result<Option<bool>> {
     Ok(load_app_config()?.macos_terminal_profile)
 }
 
+#[cfg(target_os = "macos")]
 pub fn save_macos_terminal_profile(enabled: bool) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
     let mut config = AppConfig::load_from_path(&path)?;
