@@ -1,5 +1,7 @@
 # CatDesk
 
+**English** | [繁體中文](README.zh-TW.md)
+
 An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
 
 <p align="center">
@@ -108,13 +110,13 @@ If you don't want to use CatDesk, here are some similar projects you can try:
    catdesk
    ```
 
-   When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. If browser control is enabled, select a supported Chromium browser.
+   When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. Press `l` on the mode selection screen to switch between English and Traditional Chinese; the preference is saved in `~/.catdesk/config.toml`. If browser control is enabled, select a supported Chromium browser. On macOS, CatDesk detects standard browser app bundles in `/Applications` and `~/Applications` in addition to binaries available on `PATH`.
 
    On first launch, CatDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.catdesk/config.toml` and reused on subsequent launches.
 
    By default, CatDesk listens on port `3200`. You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
 
-   On macOS Terminal.app, CatDesk manages a dedicated `CatDesk` Terminal profile automatically. If the current Terminal tab is not already using that profile, CatDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. It only starts immediately when the current tab is already using `CatDesk`. Set `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` if you want to keep the current Terminal session untouched.
+   On the first launch from macOS Terminal.app, CatDesk asks whether you want to use its dedicated `CatDesk` Terminal profile and saves that choice to `~/.catdesk/config.toml`. If enabled and the current tab is not already using that profile, CatDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. Subsequent launches reuse the saved preference. Set `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` to temporarily keep the current Terminal session untouched regardless of the saved preference.
 
 3. Wait for the TUI to show the MCP Server URL.
 
