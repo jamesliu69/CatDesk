@@ -30,6 +30,15 @@ Use concise Conventional Commit subjects such as `feat:`, `fix:`, `docs:`, `refa
 
 CatDesk can execute commands and modify files; test it in a VM or container and never commit tokens or local configuration. For forks, keep `upstream` pointed at `Xeift/CatDesk` for fetches and push only to your fork's `origin`; do not push directly to the upstream repository.
 
+### Upstream is read-only (mandatory)
+
+This repository (`origin`) is a fork of `Xeift/CatDesk`. The upstream repository belongs to the original author and must never be modified:
+
+- **Never push to `upstream`** — `upstream` is fetch-only. All pushes go to `origin` (`jamesliu69/CatDesk`) only.
+- **Never open pull requests against `Xeift/CatDesk`** — do not use `gh pr create --repo Xeift/CatDesk` or any equivalent. PRs, if any, target the fork's own branches.
+- **Never force-push, merge into, or otherwise write** to any ref under the upstream remote.
+- When integrating upstream work, use `git fetch upstream` / `git fetch upstream pull/<N>/head`, merge into a local branch, verify with `cargo fmt --check`, `cargo test --release`, and `cargo build --release`, then push the result to `origin`.
+
 ## Agent skills
 
 ### Issue tracker
