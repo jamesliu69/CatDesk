@@ -3429,6 +3429,12 @@
           next.call = call;
           next.detail = detail;
 
+          // Nothing produces this any more: the gate that did was removed. It
+          // stays because the widget renders results already stored in older
+          // conversations, and the schema string did not change, so such a
+          // payload still arrives claiming to be valid. Without this branch it
+          // would fall through to the panel for whichever tool was blocked,
+          // find none of that tool's fields, and render as invalid.
           if (data.payloadKind === "instruction_required") {
             if (!next.detail) {
               return invalidPayload(
@@ -5832,9 +5838,6 @@
           return window.fetch(requestUrl, {
             method: "GET",
             cache: "no-store",
-            headers: {
-              "ngrok-skip-browser-warning": "1",
-            },
           }).then(function (response) {
             return response
               .json()
@@ -5871,7 +5874,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "mode=" + encodeURIComponent(mode),
             })
@@ -6128,7 +6130,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "layout=" + encodeURIComponent(layout),
             })
@@ -6371,7 +6372,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "mode=" + encodeURIComponent(mode),
             })
@@ -6626,7 +6626,6 @@
               headers: {
                 "Content-Type":
                   "application/x-www-form-urlencoded;charset=UTF-8",
-                "ngrok-skip-browser-warning": "1",
               },
               body: "seed=" + encodeURIComponent(seed),
             })
@@ -6669,9 +6668,6 @@
           window
             .fetch(url, {
               method: "DELETE",
-              headers: {
-                "ngrok-skip-browser-warning": "1",
-              },
             })
             .then(function (response) {
               if (!response.ok) {
@@ -6713,9 +6709,6 @@
           window
             .fetch(url, {
               method: "POST",
-              headers: {
-                "ngrok-skip-browser-warning": "1",
-              },
             })
             .then(function (response) {
               if (!response.ok) {

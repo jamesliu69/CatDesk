@@ -112,9 +112,26 @@ If you don't want to use CatDesk, here are some similar projects you can try:
 
    When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. Press `l` on the mode selection screen to switch between English and Traditional Chinese; the preference is saved in `~/.catdesk/config.toml`. If browser control is enabled, select a supported Chromium browser. On macOS, CatDesk detects standard browser app bundles in `/Applications` and `~/Applications` in addition to binaries available on `PATH`.
 
-   On first launch, CatDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.catdesk/config.toml` and reused on subsequent launches.
+   CatDesk no longer starts or manages a tunnel itself. Configure an external HTTPS tunnel first, then enter its public base URL (for example `https://catdesk.example.com`) on first launch. The URL is saved to `~/.catdesk/config.toml` and reused on subsequent launches. Cloudflare Tunnel is the recommended setup.
 
-   By default, CatDesk listens on port `3200`. You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
+   A locally-managed Cloudflare Tunnel can forward the public hostname to CatDesk without opening an inbound port. Example Linux/Raspberry Pi configuration:
+
+   ```yaml
+   # ~/.cloudflared/config.yml
+   tunnel: <TUNNEL-UUID>
+   credentials-file: /home/<USER>/.cloudflared/<TUNNEL-UUID>.json
+   url: http://127.0.0.1:3200
+   ```
+
+   ```bash
+   cloudflared tunnel route dns <TUNNEL-UUID-OR-NAME> catdesk.example.com
+   sudo cloudflared --config /home/<USER>/.cloudflared/config.yml service install
+   sudo systemctl start cloudflared
+   ```
+
+   CatDesk only owns the local MCP server and the public URL setting. `cloudflared` owns tunnel connectivity and restart behavior.
+
+   By default, CatDesk listens only on `127.0.0.1:3200`. You can override the port with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
 
    On the first launch from macOS Terminal.app, CatDesk asks whether you want to use its dedicated `CatDesk` Terminal profile and saves that choice to `~/.catdesk/config.toml`. If enabled and the current tab is not already using that profile, CatDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. Subsequent launches reuse the saved preference. Set `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` to temporarily keep the current Terminal session untouched regardless of the saved preference.
 
@@ -186,7 +203,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 | MCP protocolVersion | `2026-07-28` |
 | Server | Axum + Tokio |
 | TUI | Ratatui |
-| Tunnel | ngrok |
+| Public access | External HTTPS tunnel (Cloudflare Tunnel recommended) |
 | Browser control | chrome-devtools-mcp |
 | Widget | HTML + JavaScript |
 | Distribution | npm |
@@ -242,7 +259,7 @@ According to [the blog](<https://help.openai.com/en/articles/11909943-gpt-53-and
   </tr>
 </table>
 
-Yes. Open [Advanced connector settings](https://chatgpt.com/#settings/Connectors/Advanced) and turn on `Enforce CSP in developer mode`. That setting removes the red button. CatDesk automatically adds the current ngrok domain to the widget CSP, so the widget should keep working with CSP enforcement enabled.
+Yes. Open [Advanced connector settings](https://chatgpt.com/#settings/Connectors/Advanced) and turn on `Enforce CSP in developer mode`. That setting removes the red button. CatDesk automatically adds the configured public base URL origin to the widget CSP, so the widget should keep working with CSP enforcement enabled.
 
 ### I've already connected. Why do I need to connect again and again?
 
@@ -331,17 +348,17 @@ The URL is made of these parts:
 
 | Part         | Example                       | What it means                                |
 | ------------ | ----------------------------- | -------------------------------------------- |
-| Public URL   | `https://xxxx.ngrok-free.dev` | Your ngrok static domain                     |
+| Public URL   | `https://catdesk.example.com` | Your external HTTPS tunnel hostname           |
 | Random path  | `/Ab3kL9xQ2pTm7VhC`           | A random path generated on first launch      |
 | MCP endpoint | `/mcp`                        | The actual MCP endpoint                      |
 
 So the full URL looks like this:
 
 ```text
-https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
+https://catdesk.example.com/Ab3kL9xQ2pTm7VhC/mcp
 ```
 
-Both the static domain and the random path are persisted in `~/.catdesk/config.toml`, so the full MCP URL stays the same across launches. You only need to set up the connector once.
+The public base URL and random path are persisted in `~/.catdesk/config.toml`, so the full MCP URL stays the same across launches as long as your external tunnel hostname stays the same. You only need to set up the connector once.
 
 # About Binagotchy
 

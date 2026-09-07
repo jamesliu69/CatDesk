@@ -306,7 +306,7 @@ uname -a
 
 - CatDesk 使用專用 Linux 帳號。
 - 不要使用 root 啟動 CatDesk。
-- 不要把 MCP/ngrok URL 分享給其他人。
+- 不要把完整 MCP Server URL 分享給其他人。
 - 重要主機建議使用 container / VM。
 
 ---

@@ -12,7 +12,7 @@ CatDesk 本身不是 AI 模型，也不呼叫 OpenAI API。ChatGPT Web 負責理
 ChatGPT Web
     │ MCP / JSON-RPC over HTTPS
     ▼
-ngrok 公開 Tunnel
+外部 HTTPS Tunnel（建議 Cloudflare Tunnel）
     │ 轉送到 127.0.0.1:3200
     ▼
 Rust + Axum HTTP Server
@@ -43,7 +43,7 @@ Rust + Axum HTTP Server
 | MCP | 自行實作 JSON-RPC | 不依賴 MCP SDK，直接處理協定訊息 |
 | 資料格式 | Serde、serde_json、toml | 解析 JSON、MCP 訊息與設定檔 |
 | 終端機 UI | Ratatui、Crossterm | 顯示彩色 TUI、鍵盤、滑鼠與動畫 |
-| 公開連線 | ngrok Rust SDK | 把本機 Server 暫時公開到網際網路 |
+| 公開連線 | 外部 HTTPS Tunnel（建議 Cloudflare Tunnel） | Tunnel 與 CatDesk 分離，由 `cloudflared` 等獨立程序把公開 hostname 轉送到本機 Server |
 | 瀏覽器控制 | chrome-devtools-mcp | 透過 Chromium Remote Debugging 控制瀏覽器 |
 | 檔案搜尋 | ripgrep、grep、內建 Rust 搜尋 | 依環境自動選擇搜尋後端 |
 | Shell 解析 | tree-sitter-bash | 解析 Bash 指令，而非單純切割字串 |
@@ -66,8 +66,8 @@ Rust + Axum HTTP Server
 5. 顯示啟動畫面與 Binagotchy。
 6. 讓使用者選擇 `Control Computer`、`Control Browser` 或 `Both`。
 7. 需要時掃描並選擇 Chromium 瀏覽器。
-8. 啟動本機 Axum Server。
-9. 啟動 ngrok Tunnel。
+8. 若尚未設定，要求使用者輸入外部 Tunnel 的 Public Base URL。
+9. 啟動本機 Axum Server。
 10. 進入主要 TUI，持續顯示連線、工具呼叫、日誌與 Token 統計。
 
 主要入口是 `#[tokio::main] async fn main()`；因此程式從一開始就運行在 Tokio 非同步 Runtime 上。
@@ -244,25 +244,51 @@ Firefox 目前可以被辨識，但因為尚未接好 Firefox 的 CDP bridge，�
 
 相關程式在 [`src/browser.rs`](../src/browser.rs) 與 [`src/devtools.rs`](../src/devtools.rs)。
 
-## ngrok 網路層
+## 公開網路層與 Cloudflare Tunnel
 
-本機 Server 預設只監聽：
+CatDesk 本機 Server 預設只監聽：
 
 ```text
 127.0.0.1:3200
 ```
 
-[`src/ngrok.rs`](../src/ngrok.rs) 使用 ngrok Rust SDK：
+CatDesk 不再內嵌或管理任何 Tunnel SDK。它只保存一個 `publicBaseUrl`，並使用：
 
-1. 讀取 ngrok authtoken。
-2. 建立 ngrok session。
-3. 將公開流量轉送到本機 port。
-4. 取得公開 URL。
-5. 組成 `https://domain/random-path/mcp`。
+```text
+<publicBaseUrl>/<random-secret-slug>/mcp
+```
 
-MCP random path 與 ngrok 設定會保存到 `~/.catdesk/config.toml`，讓 Connector 可以重複使用。
+組成給 ChatGPT Connector 使用的 MCP Server URL。Tunnel 的連線、重連與開機自動啟動由外部程序負責。建議使用 Cloudflare Tunnel，讓 `cloudflared` 將公開 hostname 轉送到：
 
-這個 URL 沒有額外登入驗證，因此它本身就像一把鑰匙。知道 URL 的人可能直接操作你的電腦，不能把它分享給其他人。
+```text
+http://127.0.0.1:3200
+```
+
+Linux / Raspberry Pi 的 `~/.cloudflared/config.yml` 可以使用：
+
+```yaml
+tunnel: <TUNNEL-UUID>
+credentials-file: /home/<USER>/.cloudflared/<TUNNEL-UUID>.json
+url: http://127.0.0.1:3200
+```
+
+建立 DNS route 後，可把 `cloudflared` 安裝成 systemd service：
+
+```bash
+cloudflared tunnel route dns <TUNNEL-UUID-OR-NAME> catdesk.example.com
+sudo cloudflared --config /home/<USER>/.cloudflared/config.yml service install
+sudo systemctl start cloudflared
+```
+
+CatDesk 的 `publicBaseUrl` 則設定為：
+
+```text
+https://catdesk.example.com
+```
+
+Public Base URL 與 MCP random path 會保存到 `~/.catdesk/config.toml`。CatDesk 不保存 Cloudflare token，也不直接呼叫 Cloudflare API。
+
+目前 MCP URL 沒有額外登入驗證，因此 random secret path 仍是安全邊界的一部分。不能把完整 MCP Server URL 分享給其他人。
 
 ## ChatGPT Widget
 
@@ -299,7 +325,7 @@ CatDesk 不會取得 ChatGPT 官方 Token 數字，而是用 `tiktoken-rs` 的 `
 
 ## 共用狀態與設定
 
-Server、TUI、ngrok 與背景工作共用：
+Server、TUI 與背景工作共用：
 
 ```rust
 Arc<Mutex<AppState>>
@@ -311,7 +337,7 @@ Arc<Mutex<AppState>>
 
 設定模型在 [`src/state.rs`](../src/state.rs)，主要保存：
 
-- ngrok token/domain
+- Public Base URL
 - MCP random slug
 - Computer/Browser/Both 模式
 - MultiTools/ReadOnly 模式
@@ -390,7 +416,6 @@ npm install -g catdesk
 | `src/change_tracking/` | Snapshot、ignore 與 Diff |
 | `src/browser.rs` | 瀏覽器偵測與 Remote Debugging |
 | `src/devtools.rs` | chrome-devtools-mcp JSON-RPC bridge |
-| `src/ngrok.rs` | ngrok Tunnel |
 | `src/widget/` | ChatGPT 內嵌 Widget |
 | `src/mascot.rs`、`src/binagotchy_gen/` | Binagotchy 圖像與動畫 |
 
@@ -401,6 +426,6 @@ CatDesk 的技術本質是：
 > ChatGPT Web 的大腦
 > + CatDesk 的本機手腳
 > + MCP 的共同語言
-> + ngrok 的網路通道
+> + 外部 HTTPS Tunnel 的網路通道
 > + Rust 的跨平台執行與安全控制
 
