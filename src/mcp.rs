@@ -43,6 +43,9 @@ const INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER: &str =
 const INITIAL_TOOL_NAME_PLACEHOLDER: &str = "__catdeskInitialToolNamePlaceholder__";
 const INITIAL_MASCOT_OUTLINE_PLACEHOLDER: &str = "__catdeskInitialMascotOutlinePlaceholder__";
 const MAX_COMMAND_OUTPUT_CHARS: usize = 24_000;
+static REENABLE_WIDGET_IMAGE: OnceLock<String> = OnceLock::new();
+static REFRESH_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
+static REMOVE_CATDESK_IMAGE: OnceLock<String> = OnceLock::new();
 
 // ── JSON-RPC types ──────────────────────────────────────────
 
@@ -113,6 +116,7 @@ impl TokenUsage {
 struct AutoWidgetContext {
     is_error: bool,
     turn_files: Vec<FileChange>,
+    changed_files_json: Vec<Value>,
 }
 
 // ── Handler ─────────────────────────────────────────────────
@@ -366,23 +370,29 @@ fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
     let initial_mascot_outline =
         serde_json::to_string(&mascot::build_widget_mascot_outline(mascot_seed))
             .unwrap_or_else(|_| "{}".to_string());
-    let reenable_widget_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REENABLE_WIDGET_PNG)
-    );
-    let refresh_catdesk_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REFRESH_CATDESK_PNG)
-    );
-    let remove_catdesk_image = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(REMOVE_CATDESK_PNG)
-    );
+    let reenable_widget_image = REENABLE_WIDGET_IMAGE.get_or_init(|| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(REENABLE_WIDGET_PNG)
+        )
+    });
+    let refresh_catdesk_image = REFRESH_CATDESK_IMAGE.get_or_init(|| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(REFRESH_CATDESK_PNG)
+        )
+    });
+    let remove_catdesk_image = REMOVE_CATDESK_IMAGE.get_or_init(|| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(REMOVE_CATDESK_PNG)
+        )
+    });
     CATDESK_WIDGET_HTML
         .replace(WIDGET_RESOURCE_URI_PLACEHOLDER, resource_uri)
-        .replace(REENABLE_WIDGET_IMAGE_PLACEHOLDER, &reenable_widget_image)
-        .replace(REFRESH_CATDESK_IMAGE_PLACEHOLDER, &refresh_catdesk_image)
-        .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, &remove_catdesk_image)
+        .replace(REENABLE_WIDGET_IMAGE_PLACEHOLDER, reenable_widget_image)
+        .replace(REFRESH_CATDESK_IMAGE_PLACEHOLDER, refresh_catdesk_image)
+        .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, remove_catdesk_image)
         .replace(
             INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER,
             current_token_stats_layout().as_str(),
@@ -1198,12 +1208,17 @@ async fn handle_tools_call_with_show_detail_mode(
     let has_turn_changes = !turn_files.is_empty();
     let widget_context = AutoWidgetContext {
         is_error,
+        changed_files_json: changed_files_json(&turn_files),
         turn_files,
     };
 
     let tool_name = tool_name_from_request(req);
     if has_turn_changes && let Some(result) = response.result.as_mut() {
-        attach_changed_files(result, &widget_context.turn_files);
+        attach_changed_file_values(
+            result,
+            &widget_context.changed_files_json,
+            widget_context.turn_files.len(),
+        );
     }
     if let Some(result) = response.result.take() {
         if has_turn_changes {
@@ -2634,6 +2649,10 @@ fn file_entry_json(file: &FileChange) -> Value {
     })
 }
 
+fn changed_files_json(files: &[FileChange]) -> Vec<Value> {
+    files.iter().map(file_entry_json).collect()
+}
+
 /// Total diff text attached to a tool result for the model. Smaller than the
 /// widget's own cap because this rides along on every call that changes a file,
 /// and is sized to confirm an edit landed rather than to carry a rewrite.
@@ -2650,6 +2669,11 @@ const MAX_MODEL_DIFF_BYTES: usize = 4_000;
 /// not at all -- half a diff reads like a complete one and would be worse than
 /// none -- and `changedFileDiffsOmitted` says how many were left out.
 fn attach_changed_files(result: &mut Value, files: &[FileChange]) {
+    let entries = changed_files_json(files);
+    attach_changed_file_values(result, &entries, files.len());
+}
+
+fn attach_changed_file_values(result: &mut Value, entries: &[Value], file_count: usize) {
     let Some(structured) = result
         .get_mut("structuredContent")
         .and_then(Value::as_object_mut)
@@ -2659,23 +2683,22 @@ fn attach_changed_files(result: &mut Value, files: &[FileChange]) {
 
     let mut remaining = MAX_MODEL_DIFF_BYTES;
     let mut omitted = 0_usize;
-    let entries = files
+    let entries = entries
         .iter()
         .map(|file| {
-            let diff = if file.diff.len() <= remaining {
-                remaining -= file.diff.len();
-                file.diff.as_str()
+            let diff = file.get("diff").and_then(Value::as_str).unwrap_or_default();
+            let diff = if diff.len() <= remaining {
+                remaining -= diff.len();
+                diff
             } else {
                 omitted += 1;
                 ""
             };
-            json!({
-                "path": file.path,
-                "status": file.status,
-                "added": file.added,
-                "removed": file.removed,
-                "diff": diff,
-            })
+            let mut entry = file.clone();
+            if let Some(entry_obj) = entry.as_object_mut() {
+                entry_obj.insert("diff".to_string(), Value::String(diff.to_string()));
+            }
+            entry
         })
         .collect::<Vec<_>>();
 
@@ -2683,7 +2706,7 @@ fn attach_changed_files(result: &mut Value, files: &[FileChange]) {
     // that many files is indistinguishable from a complete one. Saying which it
     // was is the difference between the model trusting this and having to ask
     // git anyway.
-    let at_cap = files.len() >= crate::change_tracking::MAX_DIFF_FILES;
+    let at_cap = file_count >= crate::change_tracking::MAX_DIFF_FILES;
 
     structured.insert("changedFiles".to_string(), Value::Array(entries));
     structured.insert("changedFileDiffsOmitted".to_string(), json!(omitted));
@@ -2707,11 +2730,7 @@ fn widget_changed_files(widget_context: Option<&AutoWidgetContext>) -> (Vec<Valu
     let Some(ctx) = widget_context else {
         return (Vec::new(), false);
     };
-    let changed_files = ctx
-        .turn_files
-        .iter()
-        .map(file_entry_json)
-        .collect::<Vec<_>>();
+    let changed_files = ctx.changed_files_json.clone();
     let has_changes = !changed_files.is_empty();
     (changed_files, has_changes)
 }
@@ -3930,8 +3949,9 @@ mod tests {
 
     #[test]
     fn changed_files_reach_the_model_not_only_the_widget() {
+        let files = vec![change("a.rs", "@@ -1 +1 @@\n-a\n+b\n")];
         let mut result = json!({ "structuredContent": { "toolName": "edit" } });
-        attach_changed_files(&mut result, &[change("a.rs", "@@ -1 +1 @@\n-a\n+b\n")]);
+        attach_changed_files(&mut result, &files);
 
         let structured = &result["structuredContent"];
         assert_eq!(structured["changedFiles"][0]["path"], json!("a.rs"));
@@ -3941,6 +3961,20 @@ mod tests {
             "a diff within budget is passed through unchanged"
         );
         assert_eq!(structured["changedFileDiffsOmitted"], json!(0));
+
+        let context = AutoWidgetContext {
+            is_error: false,
+            turn_files: files.clone(),
+            changed_files_json: changed_files_json(&files),
+        };
+        let (widget_files, has_changes) = widget_changed_files(Some(&context));
+        assert!(has_changes);
+        assert_eq!(Value::Array(widget_files), structured["changedFiles"]);
+
+        let html = render_widget_html("ui://widget/catdesk-dashboard.html", 1);
+        assert!(!html.contains(REENABLE_WIDGET_IMAGE_PLACEHOLDER));
+        assert!(!html.contains(REFRESH_CATDESK_IMAGE_PLACEHOLDER));
+        assert!(!html.contains(REMOVE_CATDESK_IMAGE_PLACEHOLDER));
     }
 
     #[test]
