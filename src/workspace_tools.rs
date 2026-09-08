@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::OnceLock;
 
 /// Per-file cap; MAX_READ_BATCH_BYTES caps the whole batch.
 const MAX_READ_BYTES: usize = 512 * 1024;
@@ -20,6 +21,8 @@ const HARD_LIST_LIMIT: usize = 1000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
 const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
+static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static GREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -763,6 +766,14 @@ fn search_with_backend(
 }
 
 fn command_available(program: &str) -> bool {
+    match program {
+        "rg" => *RG_AVAILABLE.get_or_init(|| probe_command_available(program)),
+        "grep" => *GREP_AVAILABLE.get_or_init(|| probe_command_available(program)),
+        _ => probe_command_available(program),
+    }
+}
+
+fn probe_command_available(program: &str) -> bool {
     match ProcessCommand::new(program)
         .arg("--version")
         .stdout(Stdio::null())
