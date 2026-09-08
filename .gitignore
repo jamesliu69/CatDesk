@@ -4,3 +4,4 @@ log.txt
 log_old.txt
 
 .omo/
+.worktrees/
