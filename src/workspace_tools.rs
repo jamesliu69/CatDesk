@@ -23,6 +23,8 @@ const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
 static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
 static GREP_AVAILABLE: OnceLock<bool> = OnceLock::new();
+// ponytail: probes last for the process; re-probe if deployments change PATH
+// while CatDesk is running.
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

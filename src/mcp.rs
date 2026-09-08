@@ -1951,6 +1951,9 @@ enum FileStamp {
     Present { len: u64, modified: SystemTime },
 }
 
+// ponytail: metadata-only invalidation keeps reads cheap; add content hashing
+// if same-size edits with unchanged timestamps become observable.
+
 fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(FileStamp::Present {
@@ -2253,6 +2256,7 @@ Always specify the branch explicitly when using `git push`."#
     lines.join("\n")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn catdesk_instruction_structured(
     workspace_root: &str,
     mode: Mode,
@@ -2668,6 +2672,7 @@ const MAX_MODEL_DIFF_BYTES: usize = 4_000;
 /// Counts go in for every file because they are small. A diff goes in whole or
 /// not at all -- half a diff reads like a complete one and would be worse than
 /// none -- and `changedFileDiffsOmitted` says how many were left out.
+#[cfg_attr(not(test), allow(dead_code))]
 fn attach_changed_files(result: &mut Value, files: &[FileChange]) {
     let entries = changed_files_json(files);
     attach_changed_file_values(result, &entries, files.len());
