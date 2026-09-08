@@ -218,15 +218,11 @@ CatDesk 使用 `tree-sitter-bash` 解析 Shell 指令。對於簡單的：
 
 實作在 [`src/change_tracking`](../src/change_tracking)。它會避開 `.git` 等版本控制內部檔案，尊重 `.gitignore`，並限制追蹤檔案數與 Diff 大小。
 
-## Linux Landlock 安全機制
+## Linux 命令沙盒
 
-Linux 使用 Landlock ABI v3 限制命令存取檔案系統。一般情況下只允許 Workspace 與特定暫存目錄寫入，系統必要路徑則只讀。
+Linux command 執行採 fail-closed 策略。若系統提供 Bubblewrap (`bwrap`)，CatDesk 會建立獨立 mount/PID namespace，只把系統執行所需路徑以唯讀方式掛入，Workspace 與私有 scratch directory 則可寫；未允許的 HOME 內容不會出現在 sandbox 中。
 
-若核心不支援 Landlock，CatDesk 預設拒絕執行未隔離的命令。只有明確設定以下環境變數，才允許不使用核心沙盒：
-
-```text
-CATDESK_ALLOW_UNSANDBOXED_LINUX=1
-```
+若沒有 Bubblewrap，CatDesk 會退回 Landlock ABI v3。Landlock 必須完整生效；部分生效或完全不可用都會拒絕執行 command。不存在允許 unsandboxed Linux command 的環境變數或 fallback。
 
 相關實作在 [`src/linux_sandbox.rs`](../src/linux_sandbox.rs)。
 

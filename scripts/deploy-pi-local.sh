@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if ! command -v bwrap >/dev/null 2>&1; then
+	echo "Bubblewrap (bwrap) is required for Raspberry Pi command sandboxing." >&2
+	echo "Install it with: sudo apt install bubblewrap" >&2
+	exit 1
+fi
+
 echo "[1/4] Running tests..."
 cargo test
 
@@ -34,7 +40,7 @@ WRAPPER="$WRAPPER_DIR/catdesk-pi"
 mkdir -p "$WRAPPER_DIR"
 cat > "$WRAPPER" <<EOF
 #!/usr/bin/env bash
-export CATDESK_ALLOW_UNSANDBOXED_LINUX=1
+set -euo pipefail
 exec node "$PACKAGE_DIR/npm/catdesk.js" "\$@"
 EOF
 chmod 0755 "$WRAPPER"
@@ -45,4 +51,4 @@ echo "Deployment complete. Stop the currently running CatDesk, then launch with:
 echo "  cd <workspace>"
 echo "  WORKSPACE_ROOT=\"\$PWD\" $WRAPPER"
 echo
-echo "WARNING: catdesk-pi explicitly permits command execution without Landlock kernel filesystem isolation."
+echo "Linux commands are sandboxed with Bubblewrap on Raspberry Pi; CatDesk fails closed if no supported sandbox backend is available."
