@@ -124,15 +124,15 @@ impl DevtoolsBridge {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if let Ok(msg) = serde_json::from_str::<Value>(trimmed) {
-                            if let Some(id) = msg.get("id").cloned() {
-                                let sender = {
-                                    let mut map = pending.lock().await;
-                                    map.remove(&id)
-                                };
-                                if let Some(tx) = sender {
-                                    let _ = tx.send(Ok(msg));
-                                }
+                        if let Ok(msg) = serde_json::from_str::<Value>(trimmed)
+                            && let Some(id) = msg.get("id").cloned()
+                        {
+                            let sender = {
+                                let mut map = pending.lock().await;
+                                map.remove(&id)
+                            };
+                            if let Some(tx) = sender {
+                                let _ = tx.send(Ok(msg));
                             }
                         }
                     }
