@@ -231,10 +231,10 @@ Linux command 執行採 fail-closed 策略。若系統提供 Bubblewrap (`bwrap`
 瀏覽器功能由外部的 `chrome-devtools-mcp` 提供。CatDesk 會執行：
 
 ```text
-npx -y chrome-devtools-mcp@latest
+npx -y chrome-devtools-mcp@1.8.0
 ```
 
-然後透過 stdin/stdout 傳送 JSON-RPC。啟動瀏覽器模式時，CatDesk 會掃描 Chrome、Chromium、Edge、Brave、Vivaldi 與 Opera，必要時使用 Remote Debugging port 啟動獨立瀏覽器程序。
+然後透過 stdin/stdout 傳送 JSON-RPC。CatDesk 固定使用經驗證的 `1.8.0` 版本，避免 `@latest` 在未修改 CatDesk 的情況下造成行為漂移；child stderr 會保留最近的 bounded diagnostics，並附加到啟動/EOF/timeout 錯誤中。啟動瀏覽器模式時，CatDesk 會掃描 Chrome、Chromium、Edge、Brave、Vivaldi 與 Opera，必要時使用 Remote Debugging port 啟動獨立瀏覽器程序。
 
 Firefox 目前可以被辨識，但因為尚未接好 Firefox 的 CDP bridge，所以標記為不支援。
 
@@ -284,7 +284,7 @@ https://catdesk.example.com
 
 Public Base URL 與 MCP random path 會保存到 `~/.catdesk/config.toml`。CatDesk 不保存 Cloudflare token，也不直接呼叫 Cloudflare API。
 
-目前 MCP URL 沒有額外登入驗證，因此 random secret path 仍是安全邊界的一部分。不能把完整 MCP Server URL 分享給其他人。
+目前預設連線方式使用 `Authentication: None`，因此 random secret path 是 capability secret，而不是使用者身分驗證。不能把完整 MCP Server URL 分享給其他人。若需要 identity-based authentication，ChatGPT 自訂 MCP app 支援 OAuth；對 Cloudflare 架構可使用 Access Managed OAuth，但必須依其 MCP OAuth 流程設定並在受保護邊界驗證 Access assertion/token。單獨使用 Cloudflare Tunnel 只提供 HTTPS transport 與 origin 隱藏，不等同登入驗證。
 
 ## ChatGPT Widget
 

@@ -67,6 +67,7 @@ impl FlowBootstrapProgress {
 
 const APP_CONFIG_DIR_NAME: &str = ".catdesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
+const USAGE_PERSIST_TURN_THRESHOLD: u64 = 8;
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// Bump only when an existing ChatGPT connector must be removed and added again.
@@ -284,6 +285,42 @@ impl Default for AppConfig {
     }
 }
 
+#[cfg(windows)]
+fn atomic_replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
 impl AppConfig {
     fn normalized(mut self) -> Self {
         self.public_base_url = self
@@ -350,23 +387,44 @@ impl AppConfig {
         }
 
         let text = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(APP_CONFIG_FILE_NAME);
+        let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
         let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
-        use std::io::Write as _;
-        file.write_all(text.as_bytes())?;
-        file.flush()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&temp_path)?;
+            use std::io::Write as _;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))?;
+            }
+            atomic_replace_file(&temp_path, path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
-        Ok(())
+        write_result
     }
 }
 
@@ -528,6 +586,7 @@ pub struct AppState {
     pub request_count: u64,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
+    usage_dirty_turns: u64,
     pub command_jobs: CommandJobManager,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -886,6 +945,7 @@ impl AppState {
             request_count: 0,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
+            usage_dirty_turns: 0,
             command_jobs: CommandJobManager::new(),
             config_path,
             server_handle: None,
@@ -955,8 +1015,15 @@ impl AppState {
     }
 
     pub fn persist_state_with_log(&mut self) {
-        if let Err(e) = self.persist_state() {
-            self.log("WARN", format!("Failed to persist app state: {e}"));
+        match self.persist_state() {
+            Ok(()) => self.usage_dirty_turns = 0,
+            Err(e) => self.log("WARN", format!("Failed to persist app state: {e}")),
+        }
+    }
+
+    pub fn persist_usage_if_due_with_log(&mut self) {
+        if self.usage_dirty_turns >= USAGE_PERSIST_TURN_THRESHOLD {
+            self.persist_state_with_log();
         }
     }
 
@@ -975,6 +1042,7 @@ impl AppState {
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.session_usage_totals
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
+        self.usage_dirty_turns = self.usage_dirty_turns.saturating_add(1);
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
@@ -1496,6 +1564,63 @@ toolCallCount = 1
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_atomically_replaces_existing_file_without_temp_artifacts() {
+        use std::os::unix::fs::MetadataExt;
+
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-config-atomic-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp config dir");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+
+        let first = AppConfig {
+            theme: "neon".into(),
+            ..AppConfig::default()
+        };
+        first
+            .save_to_path(&config_path)
+            .expect("save initial config");
+        let first_inode = std::fs::metadata(&config_path)
+            .expect("stat initial config")
+            .ino();
+
+        let second = AppConfig {
+            theme: "ocean".into(),
+            ..AppConfig::default()
+        };
+        second
+            .save_to_path(&config_path)
+            .expect("atomically replace config");
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load replacement config");
+        assert_eq!(saved.theme, "ocean");
+        let second_inode = std::fs::metadata(&config_path)
+            .expect("stat replacement config")
+            .ino();
+        assert_ne!(
+            first_inode, second_inode,
+            "atomic replacement should install a newly written inode instead of truncating in place"
+        );
+
+        let leftovers = std::fs::read_dir(&workspace)
+            .expect("read config directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != APP_CONFIG_FILE_NAME)
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temporary config files remain: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

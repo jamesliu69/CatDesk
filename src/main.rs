@@ -1184,8 +1184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = child.start_kill();
         }
         app.server_running = false;
+        app.devtools_running = false;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
+        app.persist_state_with_log();
     }
 
     result

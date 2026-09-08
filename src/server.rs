@@ -23,6 +23,27 @@ use crate::state::{
 
 const STATELESS_FLOW_ID: &str = "stateless";
 
+async fn add_security_headers(
+    request: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("referrer-policy"),
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 #[derive(Clone)]
 struct ServerState {
     app: SharedState,
@@ -87,6 +108,7 @@ pub fn router(
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
+        .layer(axum::middleware::from_fn(add_security_headers))
         .with_state(state)
 }
 
@@ -772,7 +794,6 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
         "description": "MCP Tools for ChatGPT to control your computer and browser",
         "mode": app.mode.label(),
         "tool_mode": app.tool_mode.label(),
-        "workspace": app.workspace_root,
     }))
 }
 
@@ -2156,6 +2177,39 @@ mod tests {
             .expect("send prefixed request");
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
+        let health = client
+            .get(format!("{base}/secret-slug"))
+            .send()
+            .await
+            .expect("send health request");
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            health
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            health
+                .headers()
+                .get("x-content-type-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            health
+                .headers()
+                .get("referrer-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer")
+        );
+        let health_body: Value = health.json().await.expect("decode health response");
+        assert!(
+            health_body.get("workspace").is_none(),
+            "public health response must not disclose the local workspace path"
+        );
+
         server.abort();
         let _ = server.await;
         let _ = std::fs::remove_file(config_path);
@@ -2627,6 +2681,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_usage_is_persisted_on_a_bounded_eight_turn_threshold() {
+        let workspace_root = unique_temp_path("catdesk-usage-threshold-workspace");
+        let config_root = unique_temp_path("catdesk-usage-threshold-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_root.join("hello.txt"), "hello world\n").expect("write file");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+
+        for turn in 1..=8 {
+            let response = post_mcp(
+                State(server_state.clone()),
+                tool_call_body("read", json!({ "paths": ["hello.txt"] })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            if turn == 1 {
+                assert!(
+                    !config_path.exists(),
+                    "a single usage update should remain dirty in memory rather than rewrite config.toml"
+                );
+            }
+        }
+
+        assert!(
+            config_path.exists(),
+            "usage threshold should flush config.toml"
+        );
+        let reloaded = AppState::new_for_test(
+            8788,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload persisted usage");
+        assert_eq!(reloaded.all_time_usage_totals().tool_call_count, 8);
+
+        let _ = std::fs::remove_file(workspace_root.join("hello.txt"));
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn post_mcp_accumulates_usage_from_widget_payload_meta() {
         let workspace_root = unique_temp_path("catdesk-post-mcp-workspace");
         let config_root = unique_temp_path("catdesk-post-mcp-config");
@@ -2870,7 +2982,7 @@ async fn post_mcp_inner(
                         tool_input_tokens,
                         tool_output_tokens,
                     });
-                    app.persist_state_with_log();
+                    app.persist_usage_if_due_with_log();
                 }
                 app.all_time_usage_totals()
             };

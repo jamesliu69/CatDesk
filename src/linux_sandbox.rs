@@ -278,10 +278,7 @@ fn bubblewrap_command(
     }
 
     let mut helper = Command::new(bwrap);
-    helper
-        .arg("--die-with-parent")
-        .arg("--new-session")
-        .arg("--unshare-pid");
+    helper.arg("--new-session").arg("--unshare-pid");
 
     for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/sys"] {
         let path = Path::new(path);
@@ -404,6 +401,32 @@ mod tests {
     fn helper_marker_detection_is_exact() {
         assert_ne!(HELPER_ARG, "");
         assert!(!HELPER_ARG.contains(char::is_whitespace));
+    }
+
+    #[test]
+    fn bubblewrap_does_not_bind_lifetime_to_spawn_blocking_worker_thread() {
+        let Some(bwrap) = executable_on_path("bwrap") else {
+            return;
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-bwrap-lifetime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let (command, scratch) =
+            helper_command("true", &workspace, &workspace).expect("prepare bubblewrap command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(PathBuf::from(command.get_program()), bwrap);
+        assert!(
+            !args.iter().any(|arg| arg == "--die-with-parent"),
+            "--die-with-parent kills long-lived jobs when Tokio retires the spawn_blocking worker thread"
+        );
+
+        std::fs::remove_dir_all(scratch).expect("remove scratch directory");
+        std::fs::remove_dir_all(workspace).expect("remove workspace");
     }
 
     #[test]

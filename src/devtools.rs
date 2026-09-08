@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -8,25 +8,31 @@ use tokio::sync::{Mutex, oneshot};
 use crate::browser::DetectedBrowser;
 
 const DEVTOOLS_PROTOCOL_VERSION: &str = "2025-03-26";
+const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.8.0";
+const STDERR_DIAGNOSTIC_MAX_LINES: usize = 32;
+const STDERR_DIAGNOSTIC_MAX_CHARS_PER_LINE: usize = 512;
 const DEVTOOLS_CLIENT_NAME: &str = "catdesk-bridge";
 const DEVTOOLS_CLIENT_VERSION: &str = "4.0.0";
 const DEVTOOLS_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 type PendingResponse = Result<Value, String>;
 type PendingRequests = Arc<Mutex<HashMap<Value, oneshot::Sender<PendingResponse>>>>;
+type DiagnosticBuffer = Arc<Mutex<VecDeque<String>>>;
 
 /// A running chrome-devtools-mcp child process with stdin/stdout JSON-RPC bridge.
 pub struct DevtoolsBridge {
     child: Mutex<Child>,
     stdin: Mutex<tokio::io::BufWriter<tokio::process::ChildStdin>>,
     pending: PendingRequests,
+    diagnostics: DiagnosticBuffer,
 }
 
 impl DevtoolsBridge {
-    /// Spawn `npx chrome-devtools-mcp@latest` and set up stdio bridge.
+    /// Spawn the pinned `chrome-devtools-mcp` package and set up the stdio bridge.
     pub async fn start(selected_browser: Option<&DetectedBrowser>) -> Result<Arc<Self>, String> {
         let mut command = Command::new("npx");
-        command.args(["-y", "chrome-devtools-mcp@latest"]);
+        let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
+        command.args(["-y", &package]);
 
         if let Some(browser) = selected_browser {
             if browser.remote_debug_active {
@@ -47,21 +53,25 @@ impl DevtoolsBridge {
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn chrome-devtools-mcp: {e}"))?;
 
         let child_stdin = child.stdin.take().ok_or("No stdin")?;
         let child_stdout = child.stdout.take().ok_or("No stdout")?;
+        let child_stderr = child.stderr.take().ok_or("No stderr")?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
 
         let bridge = Arc::new(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(tokio::io::BufWriter::new(child_stdin)),
             pending: pending.clone(),
+            diagnostics: diagnostics.clone(),
         });
 
-        Self::spawn_stdout_reader(child_stdout, pending);
+        Self::spawn_stdout_reader(child_stdout, pending, diagnostics.clone());
+        Self::spawn_stderr_reader(child_stderr, diagnostics);
 
         let init_req = json!({
             "jsonrpc": "2.0",
@@ -76,7 +86,9 @@ impl DevtoolsBridge {
                 }
             }
         });
-        bridge.request(&init_req).await?;
+        if let Err(error) = bridge.request(&init_req).await {
+            return Err(bridge.with_diagnostics(error).await);
+        }
         bridge
             .notify(&json!({
                 "jsonrpc": "2.0",
@@ -87,7 +99,11 @@ impl DevtoolsBridge {
         Ok(bridge)
     }
 
-    fn spawn_stdout_reader(child_stdout: tokio::process::ChildStdout, pending: PendingRequests) {
+    fn spawn_stdout_reader(
+        child_stdout: tokio::process::ChildStdout,
+        pending: PendingRequests,
+        diagnostics: DiagnosticBuffer,
+    ) {
         tokio::spawn(async move {
             let mut reader = BufReader::new(child_stdout);
             let mut line = String::new();
@@ -95,11 +111,12 @@ impl DevtoolsBridge {
                 line.clear();
                 match reader.read_line(&mut line).await {
                     Ok(0) => {
-                        Self::fail_all_pending(
-                            &pending,
-                            "chrome-devtools-mcp stdout closed".to_string(),
+                        let error = Self::diagnostic_message(
+                            "chrome-devtools-mcp stdout closed",
+                            &diagnostics,
                         )
                         .await;
+                        Self::fail_all_pending(&pending, error).await;
                         break;
                     }
                     Ok(_) => {
@@ -120,16 +137,65 @@ impl DevtoolsBridge {
                         }
                     }
                     Err(error) => {
-                        Self::fail_all_pending(
-                            &pending,
-                            format!("chrome-devtools-mcp stdout read failed: {error}"),
+                        let error = Self::diagnostic_message(
+                            &format!("chrome-devtools-mcp stdout read failed: {error}"),
+                            &diagnostics,
                         )
                         .await;
+                        Self::fail_all_pending(&pending, error).await;
                         break;
                     }
                 }
             }
         });
+    }
+
+    fn spawn_stderr_reader(
+        child_stderr: tokio::process::ChildStderr,
+        diagnostics: DiagnosticBuffer,
+    ) {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(child_stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => Self::push_diagnostic(&diagnostics, line.trim_end()).await,
+                }
+            }
+        });
+    }
+
+    async fn push_diagnostic(diagnostics: &DiagnosticBuffer, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let truncated = line
+            .chars()
+            .take(STDERR_DIAGNOSTIC_MAX_CHARS_PER_LINE)
+            .collect::<String>();
+        let mut lines = diagnostics.lock().await;
+        lines.push_back(truncated);
+        while lines.len() > STDERR_DIAGNOSTIC_MAX_LINES {
+            lines.pop_front();
+        }
+    }
+
+    async fn diagnostic_message(base: &str, diagnostics: &DiagnosticBuffer) -> String {
+        let lines = diagnostics.lock().await;
+        if lines.is_empty() {
+            base.to_string()
+        } else {
+            format!(
+                "{base}\nchrome-devtools-mcp stderr:\n{}",
+                lines.iter().cloned().collect::<Vec<_>>().join("\n")
+            )
+        }
+    }
+
+    async fn with_diagnostics(&self, base: String) -> String {
+        Self::diagnostic_message(&base, &self.diagnostics).await
     }
 
     async fn fail_all_pending(pending: &PendingRequests, error: String) {
@@ -187,7 +253,9 @@ impl DevtoolsBridge {
             Ok(Err(_)) => Err("Response channel closed".into()),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err("Request timed out (120s)".into())
+                Err(self
+                    .with_diagnostics("Request timed out (120s)".into())
+                    .await)
             }
         }
     }
@@ -231,6 +299,24 @@ mod tests {
             insert < write,
             "request id must be registered before bytes are sent to the child"
         );
+    }
+
+    #[test]
+    fn chrome_devtools_mcp_launch_is_version_pinned() {
+        let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
+        assert_eq!(package, "chrome-devtools-mcp@1.8.0");
+        assert!(!package.contains("@latest"));
+    }
+
+    #[tokio::test]
+    async fn stderr_diagnostics_are_bounded() {
+        let diagnostics: DiagnosticBuffer = Arc::new(Mutex::new(VecDeque::new()));
+        for index in 0..(STDERR_DIAGNOSTIC_MAX_LINES + 5) {
+            DevtoolsBridge::push_diagnostic(&diagnostics, &format!("line-{index}")).await;
+        }
+        let lines = diagnostics.lock().await;
+        assert_eq!(lines.len(), STDERR_DIAGNOSTIC_MAX_LINES);
+        assert_eq!(lines.front().map(String::as_str), Some("line-5"));
     }
 
     #[tokio::test]

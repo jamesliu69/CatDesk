@@ -144,6 +144,9 @@ ChatGPT Web + CatDesk
    - MCP Server URL：CatDesk TUI 顯示的完整 URL
    - Authentication：`None`
 
+> [!WARNING]
+> 使用 `Authentication: None` 時，隨機 MCP URL 是 capability secret，不是使用者身分驗證。任何取得完整 URL 的人都可能嘗試呼叫端點，因此不可分享完整網址。若需要真正的身分驗證，請在 CatDesk 前方部署 MCP 相容的 OAuth 2.0 驗證層（例如 Cloudflare Access Managed OAuth），並在受保護邊界驗證 Access assertion/token；Cloudflare Tunnel 本身只負責把 HTTPS 流量安全帶到本機 origin，並不等同使用者驗證。
+
 6. 點擊 `I understand and want to continue`。
 
 7. 點擊 `Create`，再點擊 `Connect`。
@@ -204,7 +207,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 | Server | Axum + Tokio |
 | TUI | Ratatui |
 | 公開連線 | 外部 HTTPS Tunnel（建議 Cloudflare Tunnel） |
-| 瀏覽器控制 | chrome-devtools-mcp |
+| 瀏覽器控制 | chrome-devtools-mcp 1.8.0（固定版本） |
 | Widget | HTML + JavaScript |
 | 發布方式 | npm |
 
