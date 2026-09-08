@@ -30,13 +30,13 @@ HandleAccesses(Fs(Compat(Access(Incompatible { ... }))))
 
 本 fork 已修改為：
 
-- Landlock 正常可用時：繼續使用完整 Landlock sandbox。
-- Landlock 部分生效時：仍拒絕執行，避免誤以為 sandbox 完整。
-- Landlock 完全不可用時：只有設定 `CATDESK_ALLOW_UNSANDBOXED_LINUX=1` 才允許 command 執行。
-- 沒有設定 opt-in 時仍維持 fail-safe 行為。
-- 已加入對應 regression tests。
+- Raspberry Pi 優先使用 Bubblewrap (`bwrap`) 建立 filesystem/PID namespace。
+- Workspace 與私有 scratch directory 可寫，系統執行路徑唯讀，未允許的 HOME 內容不會掛入 sandbox。
+- 沒有 Bubblewrap 時才退回 Landlock ABI v3。
+- Landlock 部分生效或完全不可用時一律拒絕 command；不再提供 unsandboxed opt-in。
+- 已加入對應 regression / Bubblewrap integration tests。
 
-> 注意：在 `CATDESK_ALLOW_UNSANDBOXED_LINUX=1` 模式下，CatDesk 的 `read/write/edit/delete` 仍有 Workspace 路徑檢查，但 shell command 不再有 Landlock kernel filesystem confinement。請只在你信任的 Raspberry Pi / VM / container 中使用。
+> Raspberry Pi 部署需要安裝 `bubblewrap`。這是 command 可用性的必要條件，不再以關閉 filesystem confinement 的方式換取相容性。
 
 ---
 
@@ -215,11 +215,11 @@ mkdir -p ~/.local/bin
 建立 launcher：
 
 ```bash
+sudo apt install -y bubblewrap
+
 cat > ~/.local/bin/catdesk-pi <<'EOF'
 #!/usr/bin/env bash
-set -e
-
-export CATDESK_ALLOW_UNSANDBOXED_LINUX=1
+set -euo pipefail
 exec catdesk "$@"
 EOF
 
@@ -334,7 +334,7 @@ git add src/linux_sandbox.rs scripts/deploy-pi-local.sh CATDESK_PI_LANDLOCK_FIX.
 提交範例：
 
 ```bash
-git commit -m "fix(linux): allow explicit fallback without Landlock"
+git commit -m "fix: sandbox linux commands with bubblewrap"
 ```
 
 推到你的 fork：

@@ -43,12 +43,14 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{
     Mutex,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    oneshot,
 };
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const MODE_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
 const MCP_PATH_MASK: &str = "/▓▓▓▓▓▓▓▓/mcp";
@@ -1065,6 +1067,40 @@ fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<
 
 // ── Main ────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeMode {
+    Tui,
+    Headless,
+}
+
+fn parse_runtime_mode<I, S>(args: I) -> Result<RuntimeMode, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut runtime_mode = RuntimeMode::Tui;
+    for argument in args.into_iter().skip(1) {
+        match argument.as_ref() {
+            "--headless" => runtime_mode = RuntimeMode::Headless,
+            unknown => return Err(format!("Unknown argument: {unknown}")),
+        }
+    }
+    Ok(runtime_mode)
+}
+
+struct RunningServices {
+    devtools: Option<Arc<DevtoolsBridge>>,
+    server_exit: oneshot::Receiver<Result<(), String>>,
+}
+
+fn record_server_exit(app: &mut AppState, result: &Result<(), String>) {
+    app.server_running = false;
+    match result {
+        Ok(()) => app.log("WARN", "MCP server exited unexpectedly".into()),
+        Err(error) => app.log("ERROR", format!("MCP server exited: {error}")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
@@ -1073,20 +1109,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unreachable!("Landlock helper returned after exec");
     }
 
-    match macos_terminal::maybe_relaunch_in_terminal_profile() {
-        Ok(macos_terminal::LaunchAction::Continue) => {}
-        #[cfg(target_os = "macos")]
-        Ok(macos_terminal::LaunchAction::ExitAfterProfileBootstrap) => {
-            eprintln!(
-                "CatDesk applied the Terminal.app profile. Run the same command again in this tab."
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(std::io::Error::other(format!(
-                "CatDesk: macOS Terminal profile bootstrap failed: {error}"
-            ))
-            .into());
+    let runtime_mode = parse_runtime_mode(std::env::args()).map_err(std::io::Error::other)?;
+
+    if runtime_mode == RuntimeMode::Tui {
+        match macos_terminal::maybe_relaunch_in_terminal_profile() {
+            Ok(macos_terminal::LaunchAction::Continue) => {}
+            #[cfg(target_os = "macos")]
+            Ok(macos_terminal::LaunchAction::ExitAfterProfileBootstrap) => {
+                eprintln!(
+                    "CatDesk applied the Terminal.app profile. Run the same command again in this tab."
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "CatDesk: macOS Terminal profile bootstrap failed: {error}"
+                ))
+                .into());
+            }
         }
     }
 
@@ -1103,6 +1143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut app = state.lock().await;
         app.persist_state_with_log();
+    }
+
+    if runtime_mode == RuntimeMode::Headless {
+        return run_headless(state).await;
     }
 
     enable_raw_mode()?;
@@ -1140,21 +1184,143 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = child.start_kill();
         }
         app.server_running = false;
+        app.devtools_running = false;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
+        app.persist_state_with_log();
     }
 
     result
 }
 
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+async fn cleanup_headless_services(state: SharedState, devtools: Option<Arc<DevtoolsBridge>>) {
+    let command_jobs = { state.lock().await.command_jobs.clone() };
+    command_jobs.cancel_all().await;
+
+    if let Some(bridge) = devtools {
+        bridge.stop().await;
+    }
+
+    let mut app = state.lock().await;
+    if let Some(handle) = app.server_handle.take() {
+        handle.abort();
+    }
+    if let Some(child) = app.remote_browser_child.as_mut() {
+        let _ = child.start_kill();
+    }
+    if let Some(child) = app.devtools_child.as_mut() {
+        let _ = child.start_kill();
+    }
+    app.server_running = false;
+    app.devtools_running = false;
+    app.remote_connected = false;
+    app.last_remote_activity_ms = None;
+    app.persist_state_with_log();
+}
+
+async fn run_headless(state: SharedState) -> Result<(), Box<dyn std::error::Error>> {
+    let (ui_event_tx, mut ui_event_rx) = unbounded_channel();
+    let RunningServices {
+        devtools,
+        mut server_exit,
+    } = start_services(state.clone(), ui_event_tx)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    let event_state = state.clone();
+    let event_task = tokio::spawn(async move {
+        while let Some(event) = ui_event_rx.recv().await {
+            event_state.lock().await.apply_server_ui_event(event);
+        }
+    });
+
+    let (port, mode) = {
+        let app = state.lock().await;
+        (app.port, app.mode)
+    };
+    eprintln!(
+        "CatDesk headless service running on 127.0.0.1:{port} in {} mode",
+        mode.label()
+    );
+
+    let outcome = tokio::select! {
+        result = &mut server_exit => {
+            match result {
+                Ok(Ok(())) => Err(std::io::Error::other("MCP server exited unexpectedly")),
+                Ok(Err(error)) => Err(std::io::Error::other(format!("MCP server failed: {error}"))),
+                Err(_) => Err(std::io::Error::other("MCP server exit monitor closed unexpectedly")),
+            }
+        }
+        signal = shutdown_signal() => signal,
+    };
+
+    event_task.abort();
+    cleanup_headless_services(state, devtools).await;
+    outcome.map_err(Into::into)
+}
+
 // ── Phase 1: Mode selection ─────────────────────────────────
+
+fn mode_selection_default_action(elapsed: Duration) -> Option<Mode> {
+    (elapsed >= MODE_SELECTION_TIMEOUT).then_some(Mode::Computer)
+}
+
+fn apply_mode_selection_defaults(app: &mut AppState) {
+    app.ui_language = UiLanguage::TraditionalChinese;
+}
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Always enter mode selection in Traditional Chinese. If the operator does not
+    // choose a mode within five seconds, continue with Control Computer mode.
+    {
+        let mut app = state.lock().await;
+        if app.ui_language != UiLanguage::TraditionalChinese {
+            apply_mode_selection_defaults(&mut app);
+            app.log(
+                "INFO",
+                "UI language: 繁體中文 (mode selection default)".into(),
+            );
+            app.persist_state_with_log();
+        }
+    }
+    let mut mode_selection_started = Instant::now();
+
     // Draw mode selection screen
     loop {
+        if let Some(mode) = mode_selection_default_action(mode_selection_started.elapsed()) {
+            let mut app = state.lock().await;
+            app.mode = mode;
+            app.log(
+                "INFO",
+                format!(
+                    "Mode selection timed out after {} seconds; defaulting to {}",
+                    MODE_SELECTION_TIMEOUT.as_secs(),
+                    mode.label()
+                ),
+            );
+            app.persist_state_with_log();
+            break;
+        }
         let (current_theme, current_tool_mode, current_ui_language) = {
             let app = state.lock().await;
             (app.current_theme(), app.tool_mode, app.ui_language)
@@ -1178,10 +1344,12 @@ async fn run_app(
                         let language = app.ui_language.label();
                         app.log("INFO", format!("UI language: {language}"));
                         app.persist_state_with_log();
+                        mode_selection_started = Instant::now();
                         continue;
                     }
                     KeyCode::Char('s') => {
                         run_settings(terminal, state.clone()).await?;
+                        mode_selection_started = Instant::now();
                         continue;
                     }
                     _ => continue,
@@ -1211,7 +1379,12 @@ async fn run_app(
 
     // Start services
     let (ui_event_tx, mut ui_event_rx) = unbounded_channel();
-    let devtools_bridge = start_services(state.clone(), ui_event_tx).await;
+    let RunningServices {
+        devtools: devtools_bridge,
+        server_exit: _server_exit,
+    } = start_services(state.clone(), ui_event_tx)
+        .await
+        .map_err(std::io::Error::other)?;
 
     run_chatgpt_connector_refresh_notice(terminal, state.clone(), &mut ui_event_rx).await?;
 
@@ -1759,9 +1932,10 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
 mod tests {
     use super::state::{ToolMode, UiLanguage};
     use super::{
-        LogView, draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_tui_header,
-        export_logs_to_dir, mask_mcp_path_in_log, normalize_public_base_url_input,
-        wrap_log_message,
+        LogView, RuntimeMode, apply_mode_selection_defaults, draw_chatgpt_connector_refresh_notice,
+        draw_mode_select, draw_tui_header, export_logs_to_dir, mask_mcp_path_in_log,
+        mode_selection_default_action, normalize_public_base_url_input, parse_runtime_mode,
+        record_server_exit, wrap_log_message,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
@@ -1776,6 +1950,35 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn mode_selection_defaults_to_computer_after_five_seconds() {
+        assert!(mode_selection_default_action(std::time::Duration::from_millis(4_999)).is_none());
+        assert!(matches!(
+            mode_selection_default_action(std::time::Duration::from_secs(5)),
+            Some(super::state::Mode::Computer)
+        ));
+    }
+
+    #[test]
+    fn mode_selection_defaults_to_traditional_chinese() {
+        let config_path = std::env::temp_dir().join(format!(
+            "catdesk-mode-selection-defaults-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let mut app = super::state::AppState::new_for_test(
+            3200,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        app.ui_language = UiLanguage::English;
+
+        apply_mode_selection_defaults(&mut app);
+
+        assert_eq!(app.ui_language, UiLanguage::TraditionalChinese);
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]
@@ -2028,6 +2231,50 @@ mod tests {
 
         assert!(row.contains("CatDesk"));
         assert!(row.ends_with(&format!("{version} │")));
+    }
+
+    #[test]
+    fn headless_cli_mode_is_explicit_and_unknown_arguments_are_rejected() {
+        assert_eq!(
+            parse_runtime_mode(["catdesk", "--headless"]),
+            Ok(RuntimeMode::Headless)
+        );
+        assert_eq!(parse_runtime_mode(["catdesk"]), Ok(RuntimeMode::Tui));
+        assert!(parse_runtime_mode(["catdesk", "--unknown"]).is_err());
+    }
+
+    #[test]
+    fn server_exit_marks_application_not_running_and_records_failure() {
+        let config_path =
+            std::env::temp_dir().join(format!("catdesk-server-exit-{}.toml", uuid::Uuid::new_v4()));
+        let mut app = super::state::AppState::new_for_test(
+            3200,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        app.server_running = true;
+
+        record_server_exit(&mut app, &Err("listener failed".to_string()));
+
+        assert!(!app.server_running);
+        assert!(
+            app.logs
+                .iter()
+                .any(|entry| entry.level == "ERROR" && entry.message.contains("listener failed"))
+        );
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn pi_deploy_service_is_directly_supervised_without_tmux() {
+        let deploy = include_str!("../scripts/deploy-pi-local.sh");
+        assert!(deploy.contains("ExecStart="));
+        assert!(deploy.contains("--headless"));
+        assert!(deploy.contains("Restart=on-failure"));
+        assert!(deploy.contains("systemctl --user restart catdesk.service"));
+        assert!(!deploy.contains("catdesk-autostart.sh"));
+        assert!(!deploy.contains("tmux"));
     }
 }
 
@@ -3167,7 +3414,7 @@ async fn ensure_selected_browser_remote_debugging(
 async fn start_services(
     state: SharedState,
     ui_events: UnboundedSender<ServerUiEvent>,
-) -> Option<Arc<Mutex<DevtoolsBridge>>> {
+) -> Result<RunningServices, String> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
         (
@@ -3315,26 +3562,34 @@ async fn start_services(
         ui_events,
     );
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
-        Ok(l) => l,
-        Err(e) => {
-            state
-                .lock()
-                .await
-                .log("ERROR", format!("Failed to bind port {port}: {e}"));
-            return devtools_bridge;
+        Ok(listener) => listener,
+        Err(error) => {
+            let message = format!("Failed to bind port {port}: {error}");
+            state.lock().await.log("ERROR", message.clone());
+            return Err(message);
         }
     };
-
-    let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
 
     {
         let mut app = state.lock().await;
         app.server_running = true;
-        app.server_handle = Some(handle);
         app.log("INFO", format!("MCP Server started on port {port}"));
     }
+
+    let (server_exit_tx, server_exit_rx) = oneshot::channel();
+    let server_state = state.clone();
+    let handle = tokio::spawn(async move {
+        let result = axum::serve(listener, router)
+            .await
+            .map_err(|error| error.to_string());
+        {
+            let mut app = server_state.lock().await;
+            record_server_exit(&mut app, &result);
+        }
+        let _ = server_exit_tx.send(result);
+    });
+
+    state.lock().await.server_handle = Some(handle);
 
     {
         let mut app = state.lock().await;
@@ -3343,7 +3598,10 @@ async fn start_services(
         }
     }
 
-    devtools_bridge
+    Ok(RunningServices {
+        devtools: devtools_bridge,
+        server_exit: server_exit_rx,
+    })
 }
 
 // ── Phase 2: Main TUI ──────────────────────────────────────
@@ -3351,7 +3609,7 @@ async fn start_services(
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
-    _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    _devtools: Option<Arc<DevtoolsBridge>>,
     mut ui_events: UnboundedReceiver<ServerUiEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;

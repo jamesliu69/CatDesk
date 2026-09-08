@@ -332,10 +332,14 @@ struct PreparedShellCommand {
     cleanup_dir: Option<PathBuf>,
 }
 
-fn shell_command(command: &str, workspace_root: &Path) -> io::Result<PreparedShellCommand> {
+fn shell_command(
+    command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
+) -> io::Result<PreparedShellCommand> {
     #[cfg(windows)]
     {
-        let _ = workspace_root;
+        let _ = (workspace_root, cwd);
         let mut shell = Command::new("powershell.exe");
         shell
             .arg("-NoLogo")
@@ -353,7 +357,7 @@ fn shell_command(command: &str, workspace_root: &Path) -> io::Result<PreparedShe
 
     #[cfg(all(not(windows), not(target_os = "linux")))]
     {
-        let _ = workspace_root;
+        let _ = (workspace_root, cwd);
         let mut shell = Command::new("/bin/bash");
         shell.arg("-c").arg(command);
         Ok(PreparedShellCommand {
@@ -364,7 +368,8 @@ fn shell_command(command: &str, workspace_root: &Path) -> io::Result<PreparedShe
 
     #[cfg(all(target_os = "linux", not(test)))]
     {
-        let (helper, scratch_dir) = crate::linux_sandbox::helper_command(command, workspace_root)?;
+        let (helper, scratch_dir) =
+            crate::linux_sandbox::helper_command(command, workspace_root, cwd)?;
         Ok(PreparedShellCommand {
             command: Command::from(helper),
             cleanup_dir: Some(scratch_dir),
@@ -373,7 +378,7 @@ fn shell_command(command: &str, workspace_root: &Path) -> io::Result<PreparedShe
 
     #[cfg(all(target_os = "linux", test))]
     {
-        let _ = workspace_root;
+        let _ = (workspace_root, cwd);
         let mut shell = Command::new("/bin/bash");
         shell.arg("-c").arg(command);
         Ok(PreparedShellCommand {
@@ -388,7 +393,7 @@ fn spawn_shell_command_blocking(
     workspace_root: &Path,
     cwd: &Path,
 ) -> io::Result<SpawnedProcess> {
-    let prepared = shell_command(command, workspace_root)?;
+    let prepared = shell_command(command, workspace_root, cwd)?;
     let mut shell = prepared.command;
     let mut cleanup_dir = prepared.cleanup_dir;
     shell

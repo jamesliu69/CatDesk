@@ -12,7 +12,7 @@ use landlock::{
 };
 
 pub const HELPER_ARG: &str = "__catdesk_landlock_exec";
-const ALLOW_UNSANDBOXED_ENV: &str = "CATDESK_ALLOW_UNSANDBOXED_LINUX";
+const BUBBLEWRAP_EXECUTABLE: &str = "bwrap";
 
 // ABI v3 is the minimum safe baseline for filesystem confinement because it
 // adds control over truncate(2). Older ABIs could otherwise leave an outside
@@ -133,6 +133,8 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
         // inaccessible.
         insert_existing(&mut paths, home.join(".gitconfig"));
         insert_existing(&mut paths, home.join(".config/git/config"));
+        insert_existing(&mut paths, home.join(".git-credentials"));
+        insert_existing(&mut paths, home.join(".config/gh/hosts.yml"));
         insert_existing(&mut paths, home.join(".ssh/known_hosts"));
     }
 
@@ -156,27 +158,15 @@ fn runtime_write_paths() -> BTreeSet<PathBuf> {
     paths
 }
 
-fn allow_unsandboxed_linux() -> bool {
-    std::env::var_os(ALLOW_UNSANDBOXED_ENV)
-        .as_deref()
-        .is_some_and(|value| value == OsStr::new("1"))
-}
-
-fn validate_ruleset_status(status: RulesetStatus, allow_unsandboxed: bool) -> io::Result<()> {
+fn validate_ruleset_status(status: RulesetStatus) -> io::Result<()> {
     match status {
         RulesetStatus::FullyEnforced => Ok(()),
         RulesetStatus::PartiallyEnforced => Err(io::Error::other(
             "Landlock sandbox was only partially enforced",
         )),
-        RulesetStatus::NotEnforced if allow_unsandboxed => {
-            eprintln!(
-                "WARNING: Landlock is unavailable; running command without kernel filesystem isolation because {ALLOW_UNSANDBOXED_ENV}=1"
-            );
-            Ok(())
-        }
-        RulesetStatus::NotEnforced => Err(io::Error::other(format!(
-            "Landlock sandbox is unavailable. Set {ALLOW_UNSANDBOXED_ENV}=1 only if you explicitly accept running commands without kernel filesystem isolation"
-        ))),
+        RulesetStatus::NotEnforced => Err(io::Error::other(
+            "Landlock sandbox is unavailable and CatDesk refuses unsandboxed Linux command execution",
+        )),
     }
 }
 
@@ -218,18 +208,18 @@ pub fn apply_workspace_landlock(
         .no_new_privs(true)
         .restrict_self()?;
 
-    validate_ruleset_status(ruleset.ruleset, allow_unsandboxed_linux())?;
+    validate_ruleset_status(ruleset.ruleset)?;
     Ok(())
 }
 
-pub fn helper_command(command: &str, workspace: &Path) -> io::Result<(Command, PathBuf)> {
-    let executable = std::env::current_exe().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to locate CatDesk executable for Landlock helper: {error}"),
-        )
-    })?;
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
 
+fn create_private_scratch_dir() -> io::Result<PathBuf> {
     let scratch_dir =
         std::env::temp_dir().join(format!("catdesk-sandbox-{}", uuid::Uuid::new_v4()));
     let mut dir_builder = std::fs::DirBuilder::new();
@@ -240,11 +230,132 @@ pub fn helper_command(command: &str, workspace: &Path) -> io::Result<(Command, P
             io::Error::new(
                 error.kind(),
                 format!(
-                    "failed to create Landlock scratch directory {}: {error}",
+                    "failed to create sandbox scratch directory {}: {error}",
                     scratch_dir.display()
                 ),
             )
         })?;
+    Ok(scratch_dir)
+}
+
+fn system_runtime_root(path: &Path) -> bool {
+    ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/sys"]
+        .iter()
+        .map(Path::new)
+        .any(|root| path == root || path.starts_with(root))
+}
+
+fn add_parent_directories(helper: &mut Command, path: &Path, created: &mut BTreeSet<PathBuf>) {
+    let mut parents = Vec::new();
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if parent == Path::new("/") {
+            break;
+        }
+        parents.push(parent.to_path_buf());
+        current = parent.parent();
+    }
+    parents.reverse();
+    for parent in parents {
+        if created.insert(parent.clone()) {
+            helper.arg("--dir").arg(parent);
+        }
+    }
+}
+
+fn bubblewrap_command(
+    bwrap: &Path,
+    command: &str,
+    workspace: &Path,
+    cwd: &Path,
+    scratch_dir: &Path,
+) -> io::Result<Command> {
+    let workspace = canonical_existing(workspace)?;
+    let cwd = canonical_existing(cwd)?;
+    if !cwd.starts_with(&workspace) {
+        return Err(io::Error::other(format!(
+            "Bubblewrap cwd escapes workspace: {}",
+            cwd.display()
+        )));
+    }
+
+    let mut helper = Command::new(bwrap);
+    helper.arg("--new-session").arg("--unshare-pid");
+
+    for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/sys"] {
+        let path = Path::new(path);
+        if path.exists() {
+            helper.arg("--ro-bind").arg(path).arg(path);
+        }
+    }
+
+    helper
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--tmpfs")
+        .arg("/tmp");
+
+    let mut created_dirs = BTreeSet::new();
+    for path in runtime_read_paths() {
+        if system_runtime_root(&path) || path.starts_with(&workspace) {
+            continue;
+        }
+        add_parent_directories(&mut helper, &path, &mut created_dirs);
+        helper.arg("--ro-bind").arg(&path).arg(&path);
+    }
+
+    add_parent_directories(&mut helper, &workspace, &mut created_dirs);
+    helper.arg("--bind").arg(&workspace).arg(&workspace);
+
+    add_parent_directories(&mut helper, scratch_dir, &mut created_dirs);
+    helper
+        .arg("--bind")
+        .arg(scratch_dir)
+        .arg(scratch_dir)
+        .arg("--chdir")
+        .arg(&cwd)
+        .arg("--setenv")
+        .arg("TMPDIR")
+        .arg(scratch_dir)
+        .arg("--setenv")
+        .arg("TMP")
+        .arg(scratch_dir)
+        .arg("--setenv")
+        .arg("TEMP")
+        .arg(scratch_dir)
+        .arg("/bin/bash")
+        .arg("-c")
+        .arg(command);
+
+    Ok(helper)
+}
+
+pub fn helper_command(
+    command: &str,
+    workspace: &Path,
+    cwd: &Path,
+) -> io::Result<(Command, PathBuf)> {
+    let scratch_dir = create_private_scratch_dir()?;
+
+    if let Some(bwrap) = executable_on_path(BUBBLEWRAP_EXECUTABLE) {
+        match bubblewrap_command(&bwrap, command, workspace, cwd, &scratch_dir) {
+            Ok(helper) => return Ok((helper, scratch_dir)),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&scratch_dir);
+                return Err(error);
+            }
+        }
+    }
+
+    let executable = std::env::current_exe().map_err(|error| {
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+        io::Error::new(
+            error.kind(),
+            format!("failed to locate CatDesk executable for Landlock helper: {error}"),
+        )
+    })?;
 
     let mut helper = Command::new(executable);
     helper
@@ -265,6 +376,35 @@ mod tests {
             .canonicalize()
             .expect("canonical /etc/resolv.conf");
         assert!(runtime_read_paths().contains(&resolv_conf));
+    }
+
+    #[test]
+    fn runtime_read_paths_include_git_credentials_without_exposing_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home).canonicalize().expect("canonical HOME");
+        let paths = runtime_read_paths();
+
+        for credential in [
+            home.join(".git-credentials"),
+            home.join(".config/gh/hosts.yml"),
+        ] {
+            if credential.exists() {
+                assert!(
+                    paths.contains(
+                        &credential
+                            .canonicalize()
+                            .expect("canonical credential file")
+                    ),
+                    "missing credential file: {}",
+                    credential.display()
+                );
+            }
+        }
+        assert!(!paths.contains(&home));
+        assert!(!paths.contains(&home.join(".config")));
+        assert!(!paths.contains(&home.join(".config/gh")));
     }
 
     #[test]
@@ -295,11 +435,99 @@ mod tests {
     }
 
     #[test]
+    fn bubblewrap_does_not_bind_lifetime_to_spawn_blocking_worker_thread() {
+        let Some(bwrap) = executable_on_path("bwrap") else {
+            return;
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-bwrap-lifetime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let (command, scratch) =
+            helper_command("true", &workspace, &workspace).expect("prepare bubblewrap command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(PathBuf::from(command.get_program()), bwrap);
+        assert!(
+            !args.iter().any(|arg| arg == "--die-with-parent"),
+            "--die-with-parent kills long-lived jobs when Tokio retires the spawn_blocking worker thread"
+        );
+
+        std::fs::remove_dir_all(scratch).expect("remove scratch directory");
+        std::fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[test]
+    fn helper_command_prefers_bubblewrap_when_available() {
+        let Some(bwrap) = executable_on_path("bwrap") else {
+            return;
+        };
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-bwrap-workspace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        let (command, scratch) =
+            helper_command("true", &workspace, &workspace).expect("prepare sandbox command");
+
+        assert_eq!(PathBuf::from(command.get_program()), bwrap);
+        std::fs::remove_dir_all(scratch).expect("remove scratch directory");
+        std::fs::remove_dir_all(workspace).expect("remove workspace");
+    }
+
+    #[test]
+    fn bubblewrap_hides_host_tmp_and_keeps_workspace_writable() {
+        if executable_on_path(BUBBLEWRAP_EXECUTABLE).is_none() {
+            return;
+        }
+
+        let workspace = std::env::temp_dir().join(format!(
+            "catdesk-bwrap-integration-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "catdesk-bwrap-outside-secret-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(&outside, "secret").expect("create outside secret");
+
+        let marker = workspace.join("sandbox-marker.txt");
+        let shell = format!(
+            "test ! -e '{}' && printf sandboxed > '{}'",
+            outside.display(),
+            marker.display()
+        );
+        let (mut command, scratch) =
+            helper_command(&shell, &workspace, &workspace).expect("prepare bubblewrap command");
+        let status = command.status().expect("execute bubblewrap command");
+
+        assert!(status.success(), "bubblewrap command failed: {status}");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read workspace marker"),
+            "sandboxed"
+        );
+
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(scratch);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn unavailable_landlock_is_never_allowed_unsandboxed() {
+        let error = validate_ruleset_status(RulesetStatus::NotEnforced)
+            .expect_err("unavailable Landlock must fail closed");
+        assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
     fn helper_command_creates_private_scratch_directory() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (_command, scratch) =
-            helper_command("true", Path::new(".")).expect("prepare Landlock helper command");
+        let (_command, scratch) = helper_command("true", Path::new("."), Path::new("."))
+            .expect("prepare sandbox command");
         let mode = std::fs::metadata(&scratch)
             .expect("scratch metadata")
             .permissions()
@@ -317,27 +545,20 @@ mod tests {
 
     #[test]
     fn fully_enforced_ruleset_is_accepted() {
-        validate_ruleset_status(RulesetStatus::FullyEnforced, false)
-            .expect("fully enforced ruleset");
+        validate_ruleset_status(RulesetStatus::FullyEnforced).expect("fully enforced ruleset");
     }
 
     #[test]
     fn partially_enforced_ruleset_is_rejected() {
-        let error = validate_ruleset_status(RulesetStatus::PartiallyEnforced, true)
+        let error = validate_ruleset_status(RulesetStatus::PartiallyEnforced)
             .expect_err("partially enforced ruleset must be rejected");
         assert!(error.to_string().contains("partially enforced"));
     }
 
     #[test]
-    fn unavailable_ruleset_requires_explicit_opt_in() {
-        let error = validate_ruleset_status(RulesetStatus::NotEnforced, false)
-            .expect_err("unavailable Landlock must be rejected without opt-in");
-        assert!(error.to_string().contains(ALLOW_UNSANDBOXED_ENV));
-    }
-
-    #[test]
-    fn unavailable_ruleset_is_allowed_with_explicit_opt_in() {
-        validate_ruleset_status(RulesetStatus::NotEnforced, true)
-            .expect("explicit opt-in should allow an unavailable Landlock ruleset");
+    fn unavailable_ruleset_is_rejected() {
+        let error = validate_ruleset_status(RulesetStatus::NotEnforced)
+            .expect_err("unavailable Landlock must be rejected");
+        assert!(error.to_string().contains("refuses unsandboxed"));
     }
 }

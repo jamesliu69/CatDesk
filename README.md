@@ -144,6 +144,9 @@ If you don't want to use CatDesk, here are some similar projects you can try:
    - MCP Server URL: the full URL shown in CatDesk TUI
    - Authentication: `None`
 
+> [!WARNING]
+> With `Authentication: None`, the random MCP URL is a capability secret, not user authentication. Anyone who obtains the complete URL can attempt to use the endpoint. Keep it private. For identity-based protection, place CatDesk behind an MCP-compatible OAuth 2.0 layer (for example Cloudflare Access Managed OAuth) and validate the resulting access assertion/token at the protected boundary; Cloudflare Tunnel by itself only provides transport to the local origin.
+
 6. Click `I understand and want to continue`.
 
 7. Click `Create`, then click `Connect`.
@@ -204,7 +207,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 | Server | Axum + Tokio |
 | TUI | Ratatui |
 | Public access | External HTTPS tunnel (Cloudflare Tunnel recommended) |
-| Browser control | chrome-devtools-mcp |
+| Browser control | chrome-devtools-mcp 1.8.0 (pinned) |
 | Widget | HTML + JavaScript |
 | Distribution | npm |
 

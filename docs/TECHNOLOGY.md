@@ -218,15 +218,11 @@ CatDesk 使用 `tree-sitter-bash` 解析 Shell 指令。對於簡單的：
 
 實作在 [`src/change_tracking`](../src/change_tracking)。它會避開 `.git` 等版本控制內部檔案，尊重 `.gitignore`，並限制追蹤檔案數與 Diff 大小。
 
-## Linux Landlock 安全機制
+## Linux 命令沙盒
 
-Linux 使用 Landlock ABI v3 限制命令存取檔案系統。一般情況下只允許 Workspace 與特定暫存目錄寫入，系統必要路徑則只讀。
+Linux command 執行採 fail-closed 策略。若系統提供 Bubblewrap (`bwrap`)，CatDesk 會建立獨立 mount/PID namespace，只把系統執行所需路徑以唯讀方式掛入，Workspace 與私有 scratch directory 則可寫；未允許的 HOME 內容不會出現在 sandbox 中。
 
-若核心不支援 Landlock，CatDesk 預設拒絕執行未隔離的命令。只有明確設定以下環境變數，才允許不使用核心沙盒：
-
-```text
-CATDESK_ALLOW_UNSANDBOXED_LINUX=1
-```
+若沒有 Bubblewrap，CatDesk 會退回 Landlock ABI v3。Landlock 必須完整生效；部分生效或完全不可用都會拒絕執行 command。不存在允許 unsandboxed Linux command 的環境變數或 fallback。
 
 相關實作在 [`src/linux_sandbox.rs`](../src/linux_sandbox.rs)。
 
@@ -235,10 +231,10 @@ CATDESK_ALLOW_UNSANDBOXED_LINUX=1
 瀏覽器功能由外部的 `chrome-devtools-mcp` 提供。CatDesk 會執行：
 
 ```text
-npx -y chrome-devtools-mcp@latest
+npx -y chrome-devtools-mcp@1.8.0
 ```
 
-然後透過 stdin/stdout 傳送 JSON-RPC。啟動瀏覽器模式時，CatDesk 會掃描 Chrome、Chromium、Edge、Brave、Vivaldi 與 Opera，必要時使用 Remote Debugging port 啟動獨立瀏覽器程序。
+然後透過 stdin/stdout 傳送 JSON-RPC。CatDesk 固定使用經驗證的 `1.8.0` 版本，避免 `@latest` 在未修改 CatDesk 的情況下造成行為漂移；child stderr 會保留最近的 bounded diagnostics，並附加到啟動/EOF/timeout 錯誤中。啟動瀏覽器模式時，CatDesk 會掃描 Chrome、Chromium、Edge、Brave、Vivaldi 與 Opera，必要時使用 Remote Debugging port 啟動獨立瀏覽器程序。
 
 Firefox 目前可以被辨識，但因為尚未接好 Firefox 的 CDP bridge，所以標記為不支援。
 
@@ -288,7 +284,7 @@ https://catdesk.example.com
 
 Public Base URL 與 MCP random path 會保存到 `~/.catdesk/config.toml`。CatDesk 不保存 Cloudflare token，也不直接呼叫 Cloudflare API。
 
-目前 MCP URL 沒有額外登入驗證，因此 random secret path 仍是安全邊界的一部分。不能把完整 MCP Server URL 分享給其他人。
+目前預設連線方式使用 `Authentication: None`，因此 random secret path 是 capability secret，而不是使用者身分驗證。不能把完整 MCP Server URL 分享給其他人。若需要 identity-based authentication，ChatGPT 自訂 MCP app 支援 OAuth；對 Cloudflare 架構可使用 Access Managed OAuth，但必須依其 MCP OAuth 流程設定並在受保護邊界驗證 Access assertion/token。單獨使用 Cloudflare Tunnel 只提供 HTTPS transport 與 origin 隱藏，不等同登入驗證。
 
 ## ChatGPT Widget
 
