@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use serde::Serialize;
@@ -116,6 +116,7 @@ struct CommandJob {
     started_at: Instant,
     timeout_ms: u64,
     change_session: Option<ChangeSession>,
+    final_changes: OnceLock<Vec<FileChange>>,
     runtime: Mutex<JobRuntime>,
     changed: Notify,
     cancel_tx: watch::Sender<bool>,
@@ -144,6 +145,7 @@ impl CommandJob {
                 started_at: Instant::now(),
                 timeout_ms,
                 change_session,
+                final_changes: OnceLock::new(),
                 runtime: Mutex::new(JobRuntime::default()),
                 changed: Notify::new(),
                 cancel_tx,
@@ -403,11 +405,13 @@ impl CommandJobManager {
     pub async fn current_changes(&self, job_id: &str) -> Result<Vec<FileChange>, String> {
         self.cleanup().await;
         let job = self.get_job(job_id).await?;
-        Ok(job
-            .change_session
-            .as_ref()
-            .map(ChangeSession::changes)
-            .unwrap_or_default())
+        if !job.snapshot(0).await.state.is_terminal() {
+            return Ok(Vec::new());
+        }
+        let Some(session) = job.change_session.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(job.final_changes.get_or_init(|| session.changes()).clone())
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<CommandJobSnapshot, String> {
@@ -740,6 +744,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_tracking::{ChangeScope, ChangeTarget};
 
     fn workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("catdesk-jobs-{name}-{}", Uuid::new_v4()));
@@ -771,6 +776,75 @@ mod tests {
             "command never reached ready state: {}",
             path.display()
         );
+    }
+
+    #[tokio::test]
+    async fn background_change_report_is_deferred_and_cached_until_terminal() {
+        let root = workspace("deferred-changes");
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(root.clone(), true)),
+        );
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 300"
+        } else {
+            "sleep 0.3"
+        };
+        let manager = CommandJobManager::new();
+        let started = manager
+            .start_with_change_session(
+                command.into(),
+                root.clone(),
+                root.clone(),
+                5_000,
+                None,
+                Some(session),
+            )
+            .await
+            .expect("start job");
+
+        std::fs::write(root.join("created.txt"), "created\n").expect("create file");
+        let running = manager
+            .current_changes(&started.snapshot.job_id)
+            .await
+            .expect("running changes");
+        assert!(running.is_empty());
+
+        let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
+        assert!(terminal.state.is_terminal());
+        let first = manager
+            .current_changes(&started.snapshot.job_id)
+            .await
+            .expect("terminal changes");
+        assert!(first.iter().any(|file| file.path == "created.txt"));
+        let second = manager
+            .current_changes(&started.snapshot.job_id)
+            .await
+            .expect("cached changes");
+        assert_eq!(first.len(), second.len());
+        assert_eq!(
+            first
+                .iter()
+                .map(|file| (
+                    &file.path,
+                    &file.status,
+                    file.added,
+                    file.removed,
+                    &file.diff
+                ))
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|file| (
+                    &file.path,
+                    &file.status,
+                    file.added,
+                    file.removed,
+                    &file.diff
+                ))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
