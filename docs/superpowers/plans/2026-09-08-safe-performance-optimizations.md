@@ -30,7 +30,7 @@
 - Consumes: existing `CommandJob::runtime`, `CommandJob::change_session`, and `ChangeSession::changes()`.
 - Produces: `CommandJobManager::current_changes()` that returns no intermediate changes while running and one cached complete result after terminal completion.
 
-- [ ] **Step 1: Add a regression test for terminal-only collection**
+- [x] **Step 1: Add a regression test for terminal-only collection**
 
 Create a temporary workspace, start a sleeping command with a recursive `ChangeSession`, create a file while the job is running, assert `current_changes()` is empty while running, wait for terminal state, then assert the terminal result includes the file and the second terminal query returns the same result.
 
@@ -65,13 +65,13 @@ async fn background_change_report_is_deferred_and_cached_until_terminal() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run: `cargo test background_change_report_is_deferred_and_cached_until_terminal -- --nocapture`
 
 Expected: FAIL because running jobs currently scan and return the changed file, and terminal results are not cached.
 
-- [ ] **Step 3: Add one-time final-result storage**
+- [x] **Step 3: Add one-time final-result storage**
 
 Import `std::sync::OnceLock`, add `final_changes: OnceLock<Vec<FileChange>>` to `CommandJob`, initialize it in `new_with_change_session`, and update `current_changes`:
 
@@ -91,13 +91,13 @@ Ok(job
 
 The final closure must call the existing full `ChangeSession::changes()` implementation; do not add metadata-only logic to this path.
 
-- [ ] **Step 4: Run the focused test and the command-job tests**
+- [x] **Step 4: Run the focused test and the command-job tests**
 
 Run: `cargo test command_jobs::tests -- --nocapture`
 
 Expected: PASS, including the new deferred/cached report test.
 
-- [ ] **Step 5: Commit the isolated change-tracking behavior**
+- [x] **Step 5: Commit the isolated change-tracking behavior**
 
 ```bash
 git add src/command_jobs.rs
@@ -114,7 +114,7 @@ git commit -m "perf: defer background change scans until completion"
 - Consumes: existing `app_config_path()`, `load_app_config()`, `agents_widget_state()`, and `read_agents_text()`.
 - Produces: private metadata-keyed cached loaders and a text-based structured instruction helper.
 
-- [ ] **Step 1: Add cache invalidation tests**
+- [x] **Step 1: Add cache invalidation tests**
 
 Add a direct helper test that writes `AGENTS.md`, calls the new cached text loader twice, updates the file, and asserts the returned value changes. Use a unique temporary directory and avoid asserting implementation details such as cache hit counters.
 
@@ -132,27 +132,27 @@ fn cached_instruction_text_reloads_after_agents_file_changes() {
 }
 ```
 
-- [ ] **Step 2: Run the focused cache test and verify it fails**
+- [x] **Step 2: Run the focused cache test and verify it fails**
 
 Run: `cargo test cached_instruction_text_reloads_after_agents_file_changes -- --nocapture`
 
 Expected: FAIL to compile because `cached_agents_text` does not exist yet.
 
-- [ ] **Step 3: Implement metadata-keyed cached loaders**
+- [x] **Step 3: Implement metadata-keyed cached loaders**
 
 Add a small private cache record in `mcp.rs` keyed by absolute path, file length, and `metadata.modified()`. Cache only successful reads/parses; on metadata or read/parse errors, bypass/update no cache and return the original error/`None` behavior. Use `Mutex` plus `OnceLock` from the standard library. Replace the MCP call sites in `agents_widget_state()` and `current_token_stats_layout()` with the cached config loader, and use the cached text loader from `preferred_agents_text()`.
 
-- [ ] **Step 4: Reuse instruction text for the plain and structured response**
+- [x] **Step 4: Reuse instruction text for the plain and structured response**
 
 Keep the existing `catdesk_instruction_structured()` helper for tests and compatibility, add `catdesk_instruction_structured_from_text(&str) -> Value`, and have `handle_catdesk_instruction_with_show_detail_mode()` pass the already computed `instruction_text` to the new helper instead of calling `catdesk_instruction_text()` a second time.
 
-- [ ] **Step 5: Run MCP instruction/state tests**
+- [x] **Step 5: Run MCP instruction/state tests**
 
 Run: `cargo test mcp::tests -- --nocapture` and `cargo test state::tests -- --nocapture`
 
 Expected: PASS with unchanged instruction contents and widget fields.
 
-- [ ] **Step 6: Commit config/instruction caching**
+- [x] **Step 6: Commit config/instruction caching**
 
 ```bash
 git add src/mcp.rs
@@ -169,7 +169,7 @@ git commit -m "perf: cache repeated MCP instruction reads"
 - Consumes: existing `FileChange`, `AutoWidgetContext`, `file_entry_json()`, and compile-time PNG byte arrays.
 - Produces: unchanged structured/widget payloads backed by shared conversion helpers and one-time PNG base64 strings.
 
-- [ ] **Step 1: Add payload equivalence tests**
+- [x] **Step 1: Add payload equivalence tests**
 
 Extend `changed_files_reach_the_model_not_only_the_widget` with an `AutoWidgetContext` using the same `FileChange`, then assert the widget entries equal the structured entries. Add a resource assertion that renders `/ui://widget/catdesk-dashboard.html` and checks all three embedded image placeholders were replaced.
 
@@ -187,15 +187,15 @@ assert!(!html.contains(REFRESH_CATDESK_IMAGE_PLACEHOLDER));
 assert!(!html.contains(REMOVE_CATDESK_IMAGE_PLACEHOLDER));
 ```
 
-- [ ] **Step 2: Extract one shared changed-file value list**
+- [x] **Step 2: Extract one shared changed-file value list**
 
 Add `changed_files_json: Vec<Value>` to `AutoWidgetContext`, initialize it once from `turn_files` in `handle_tools_call_with_show_detail_mode`, and have both `attach_changed_files` and `widget_changed_files` clone from that list. Apply the existing 4,000-byte model diff cap to the structured clone only; preserve `changedFileDiffsOmitted` and `changedFilesAtCap` exactly.
 
-- [ ] **Step 3: Cache static PNG base64 strings with `OnceLock`**
+- [x] **Step 3: Cache static PNG base64 strings with `OnceLock`**
 
 Add one `OnceLock<String>` per embedded PNG and replace the three per-call `.encode(...)` expressions in `render_widget_html()` with the cached strings. Keep the `data:image/png;base64,` prefix unchanged.
 
-- [ ] **Step 4: Run focused MCP tests and commit**
+- [x] **Step 4: Run focused MCP tests and commit**
 
 Run: `cargo test mcp::tests -- --nocapture`
 
@@ -214,15 +214,15 @@ git commit -m "perf: reuse widget payload and resource encodings"
 - Consumes: existing `search_with_backend()`, `search_text_rg()`, and `search_text_grep()` behavior.
 - Produces: process-wide cached availability decisions with the same backend error/fallback semantics.
 
-- [ ] **Step 1: Add a backend-selection behavior test**
+- [x] **Step 1: Add a backend-selection behavior test**
 
 Keep the existing `search-rg-dialect`, `grep_search_backend_marks_truncated_when_an_extra_match_exists`, and Rust-backend tests as the observable contract; no new host-dependent test is required because the cache only changes probe frequency, not selected backend output.
 
-- [ ] **Step 2: Cache availability probes**
+- [x] **Step 2: Cache availability probes**
 
 Use `OnceLock<bool>` for the `rg` and `grep` availability checks. If the selected executable later disappears, preserve the current `SearchBackendError::Unavailable` handling and do not silently return incomplete results.
 
-- [ ] **Step 3: Run workspace search tests and commit**
+- [x] **Step 3: Run workspace search tests and commit**
 
 Run: `cargo test workspace_tools::tests -- --nocapture`
 
@@ -236,19 +236,19 @@ git commit -m "perf: cache search backend probes"
 **Files:**
 - Modify: none unless formatting requires it
 
-- [ ] **Step 1: Run formatting and all release tests**
+- [x] **Step 1: Run formatting and all release tests**
 
 Run: `cargo fmt --check` then `cargo test --release`.
 
 Expected: all tests pass with zero failures.
 
-- [ ] **Step 2: Build the optimized binary**
+- [x] **Step 2: Build the optimized binary**
 
 Run: `cargo build --release`.
 
 Expected: optimized CatDesk binary builds successfully.
 
-- [ ] **Step 3: Review the diff and working tree**
+- [x] **Step 3: Review the diff and working tree**
 
 Run: `git diff main...HEAD --stat`, `git diff main...HEAD --check`, and `git status --short`.
 
