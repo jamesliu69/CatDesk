@@ -133,6 +133,8 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
         // inaccessible.
         insert_existing(&mut paths, home.join(".gitconfig"));
         insert_existing(&mut paths, home.join(".config/git/config"));
+        insert_existing(&mut paths, home.join(".git-credentials"));
+        insert_existing(&mut paths, home.join(".config/gh/hosts.yml"));
         insert_existing(&mut paths, home.join(".ssh/known_hosts"));
     }
 
@@ -374,6 +376,35 @@ mod tests {
             .canonicalize()
             .expect("canonical /etc/resolv.conf");
         assert!(runtime_read_paths().contains(&resolv_conf));
+    }
+
+    #[test]
+    fn runtime_read_paths_include_git_credentials_without_exposing_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home).canonicalize().expect("canonical HOME");
+        let paths = runtime_read_paths();
+
+        for credential in [
+            home.join(".git-credentials"),
+            home.join(".config/gh/hosts.yml"),
+        ] {
+            if credential.exists() {
+                assert!(
+                    paths.contains(
+                        &credential
+                            .canonicalize()
+                            .expect("canonical credential file")
+                    ),
+                    "missing credential file: {}",
+                    credential.display()
+                );
+            }
+        }
+        assert!(!paths.contains(&home));
+        assert!(!paths.contains(&home.join(".config")));
+        assert!(!paths.contains(&home.join(".config/gh")));
     }
 
     #[test]
