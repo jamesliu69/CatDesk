@@ -6,7 +6,6 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
-use tokio::sync::Mutex;
 
 use crate::change_tracking::{ChangeScope, ChangeSession, ChangeTarget, FileChange};
 use crate::command;
@@ -126,7 +125,7 @@ pub(crate) async fn handle_request_with_show_detail_mode(
     tool_mode: ToolMode,
     set_catdesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
     show_detail_mode: ShowDetailMode,
 ) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
@@ -785,7 +784,7 @@ async fn handle_tools_list(
     req: &JsonRpcRequest,
     mode: Mode,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
 ) -> JsonRpcResponse {
     handle_tools_list_with_show_detail_mode(
         req,
@@ -801,7 +800,7 @@ async fn handle_tools_list_with_show_detail_mode(
     req: &JsonRpcRequest,
     mode: Mode,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
     show_detail_mode: ShowDetailMode,
 ) -> JsonRpcResponse {
     let mut tools: Vec<Value> = Vec::new();
@@ -1053,7 +1052,7 @@ async fn handle_tools_call(
     tool_mode: ToolMode,
     set_catdesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
 ) -> JsonRpcResponse {
     handle_tools_call_with_show_detail_mode(
         req,
@@ -1077,7 +1076,7 @@ async fn handle_tools_call_with_show_detail_mode(
     tool_mode: ToolMode,
     set_catdesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
     show_detail_mode: ShowDetailMode,
 ) -> JsonRpcResponse {
     let params = &req.params;
@@ -1238,7 +1237,7 @@ async fn forward_to_devtools(
     req: &JsonRpcRequest,
     tool_name: &str,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let Some(bridge) = devtools else {
@@ -1267,8 +1266,7 @@ async fn forward_to_devtools(
         "params": params
     });
 
-    let mut b = bridge.lock().await;
-    match b.request(&forward_req).await {
+    match bridge.request(&forward_req).await {
         Ok(resp) => {
             if let Some(result) = resp.get("result") {
                 return JsonRpcResponse::success(req.id.clone(), result.clone());
@@ -3251,15 +3249,14 @@ fn tool_is_read_only(tool: &Value) -> bool {
         .unwrap_or(false)
 }
 
-async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec<Value>> {
+async fn fetch_devtools_tools(bridge: &Arc<DevtoolsBridge>) -> Option<Vec<Value>> {
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": "dt-tools-list",
         "method": "tools/list",
         "params": {}
     });
-    let mut b = bridge.lock().await;
-    let resp = b.request(&list_req).await.ok()?;
+    let resp = bridge.request(&list_req).await.ok()?;
     let dt_tools = resp
         .get("result")
         .and_then(|r| r.get("tools"))
@@ -3268,10 +3265,7 @@ async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec
     Some(dt_tools)
 }
 
-async fn devtools_tool_is_read_only(
-    bridge: &Arc<Mutex<DevtoolsBridge>>,
-    tool_name: &str,
-) -> Option<bool> {
+async fn devtools_tool_is_read_only(bridge: &Arc<DevtoolsBridge>, tool_name: &str) -> Option<bool> {
     let dt_tools = fetch_devtools_tools(bridge).await?;
     dt_tools
         .iter()

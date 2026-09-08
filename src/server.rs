@@ -10,7 +10,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
@@ -26,7 +26,7 @@ const STATELESS_FLOW_ID: &str = "stateless";
 #[derive(Clone)]
 struct ServerState {
     app: SharedState,
-    devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: Option<Arc<DevtoolsBridge>>,
     command_jobs: CommandJobManager,
     ui_events: UnboundedSender<ServerUiEvent>,
 }
@@ -34,7 +34,7 @@ struct ServerState {
 /// Build the axum router.
 pub fn router(
     app_state: SharedState,
-    devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: Option<Arc<DevtoolsBridge>>,
     command_jobs: CommandJobManager,
     mcp_path: String,
     ui_events: UnboundedSender<ServerUiEvent>,

@@ -3167,7 +3167,7 @@ async fn ensure_selected_browser_remote_debugging(
 async fn start_services(
     state: SharedState,
     ui_events: UnboundedSender<ServerUiEvent>,
-) -> Option<Arc<Mutex<DevtoolsBridge>>> {
+) -> Option<Arc<DevtoolsBridge>> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
         (
@@ -3351,7 +3351,7 @@ async fn start_services(
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
-    _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    _devtools: Option<Arc<DevtoolsBridge>>,
     mut ui_events: UnboundedReceiver<ServerUiEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
