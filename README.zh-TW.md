@@ -110,7 +110,7 @@ ChatGPT Web + CatDesk
    catdesk
    ```
 
-   CatDesk 啟動後，可以選擇 `Control Computer`、`Control Browser` 或 `Both`。在模式選擇畫面按 `l` 可以在 English 與繁體中文之間切換；語言偏好會儲存在 `~/.catdesk/config.toml`。如果啟用了瀏覽器控制，請選擇一個支援的 Chromium 瀏覽器。在 macOS 上，除了 `PATH` 中的 binary，CatDesk 也會偵測 `/Applications` 與 `~/Applications` 裡的標準瀏覽器 App bundle。
+   CatDesk 啟動後，可以選擇 `Control Computer`、`Control Browser` 或 `Both`。此 fork 的模式選擇預設為繁體中文；按 `l` 可以切換 English 與繁體中文。主畫面、設定、瀏覽器選擇、Connector 更新提示、初始化進度及常見執行訊息會跟隨所選語言。中文換行、截斷與對齊使用終端機顯示寬度；匯出 Log 保留原文並遮蔽機密資訊。如果啟用了瀏覽器控制，請選擇一個支援的 Chromium 瀏覽器。在 macOS 上，除了 `PATH` 中的 binary，CatDesk 也會偵測 `/Applications` 與 `~/Applications` 裡的標準瀏覽器 App bundle。
 
    CatDesk 不再自行啟動或管理 Tunnel。請先設定外部 HTTPS Tunnel，第一次啟動時再輸入它的公開 Base URL（例如 `https://catdesk.example.com`）。這個 URL 會儲存在 `~/.catdesk/config.toml`，之後啟動時自動重用。建議使用 Cloudflare Tunnel。
 
@@ -176,7 +176,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
   </tr>
 </table>
 
-- 為了提升效能並避免記憶體使用量過高，我強烈建議**每個小功能都開一個新 session**。如果需要上下文，可以請 ChatGPT 建立 handoff note，再貼到新的 session。工具呼叫超過 50 次之後，畫面可能會開始非常卡。
+- 需要換新對話繼續工作時，請 ChatGPT 使用 `create_handoff`。CatDesk 會回傳專案專用的 `catdesk_handoff_<workspace-name>_<short-id>.md` 檔名及 Markdown，內容包括目標、進度、決策、驗證、下一步與 Git 狀態。**產生 Handoff 不等於已存入 Library**：ChatGPT 還必須使用 Library 工具保存回傳內容。新對話會依完整專案識別前綴搜尋 Library，讀取後比對實際工作區，且只刪除已成功讀取的交接檔；若有多個符合檔案，先選定正確版本。此流程需要 Library Search 與寫入權限；CatDesk 本身不會在 repository 建立交接檔。不要放入 token、密碼或其他機密。Handoff 保存的是工作上下文，不會備份未提交檔案或延續執行中的 Job。
 <p align="center">
   <img src="docs/images/high_ram_usage.png" alt="3.9 GB Memory usage🥹" width="300"><br>
   <em>3.9 GB 記憶體用量🥹</em>
@@ -213,13 +213,14 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # 工具
 
-CatDesk 有兩種本機工具模式：`multi-tools` 提供 10 個工具，`read-only` 提供 3 個工具。
+CatDesk 有兩種本機工具模式：`multi-tools` 提供 11 個工具，`read-only` 提供 4 個工具。`create_handoff` 不修改工作區，因此兩種模式都可使用。
 
 在 `multi-tools` 模式下，CatDesk 的本機工具如下：
 
 | 工具                    | 類型  | 功能                                                                     |
 | ----------------------- | ----- | ------------------------------------------------------------------------ |
 | `catdesk_instruction`   | 指南  | 回傳 CatDesk 使用說明並顯示 Binagotchy                                  |
+| `create_handoff` | 讀取 | 產生專案交接 Markdown，交由 ChatGPT 保存到 Library |
 | `read`                  | 讀取  | 從 workspace 讀取一個或多個文字檔                                       |
 | `search`                | 讀取  | 使用 `rg`、`grep` 或內建搜尋器搜尋 workspace 文字                        |
 | `write`                 | 寫入  | 建立或覆寫檔案                                                           |
@@ -343,6 +344,12 @@ CatDesk 會按照上述順序尋找 `AGENTS.md`，每次呼叫 `catdesk_instruct
 這是 ChatGPT 端的 bug，我這邊沒有辦法修，改 CatDesk 程式碼也解決不了。這個 bug 可能是在 4 月 15 日左右出現的。
 
 # 安全性
+
+## Linux 指令 Sandbox
+
+此 fork 優先使用工作區外的可信任 `bwrap`，略過不可執行的檔案，以及解析後指向工作區內的符號連結。Bubblewrap 隔離 user、PID、IPC、UTS 與 mount namespaces，並隱藏主機的暫存目錄；開發工具仍可使用網路。沒有可信任 `bwrap` 時，保留原有 Landlock 後端且必須完整套用限制；Bubblewrap 執行失敗不會改成無隔離執行。長時間 Job 的取消仍由 CatDesk 的程序樹管理負責，不綁定短暫的工作執行緒。
+
+SSH 僅轉送有效的 `SSH_AUTH_SOCK`，並將一般檔案形式的 `.ssh/config`、`known_hosts`、`known_hosts2` 與公鑰加入讀取清單。SSH 私鑰、公鑰符號連結及 `.pub` 目錄不會加入這份清單。原有 `.git-credentials` 與 `.config/gh/hosts.yml` 的唯讀權限保留，以支援 HTTPS Git 認證。唯讀憑證及 SSH Agent 仍是敏感權限，不應提供給不受信任的程式；SSH config 引用的其他私鑰或 Include 檔案不會自動放行。
 
 > [!CAUTION]
 > **絕對不要**把 `MCP Server URL` 分享給任何人。任何拿到這個 URL 的人都可能存取你的電腦。

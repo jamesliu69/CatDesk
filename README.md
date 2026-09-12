@@ -110,7 +110,7 @@ If you don't want to use CatDesk, here are some similar projects you can try:
    catdesk
    ```
 
-   When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. Press `l` on the mode selection screen to switch between English and Traditional Chinese; the preference is saved in `~/.catdesk/config.toml`. If browser control is enabled, select a supported Chromium browser. On macOS, CatDesk detects standard browser app bundles in `/Applications` and `~/Applications` in addition to binaries available on `PATH`.
+   When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. This fork defaults mode selection to Traditional Chinese; press `l` to switch between English and Traditional Chinese. The dashboard, settings, browser selection, connector refresh notice, bootstrap progress and common runtime messages follow the selected language. CJK text uses terminal-cell widths for wrapping and alignment; exported logs retain their original text with secrets masked. If browser control is enabled, select a supported Chromium browser. On macOS, CatDesk detects standard browser app bundles in `/Applications` and `~/Applications` in addition to binaries available on `PATH`.
 
    CatDesk no longer starts or manages a tunnel itself. Configure an external HTTPS tunnel first, then enter its public base URL (for example `https://catdesk.example.com`) on first launch. The URL is saved to `~/.catdesk/config.toml` and reused on subsequent launches. Cloudflare Tunnel is the recommended setup.
 
@@ -176,7 +176,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
   </tr>
 </table>
 
-- To improve performance and avoid high memory usage, I strongly recommend **opening a new session for every small feature**. If you need context, you can ask ChatGPT to create a handoff note and paste it into the new session. It will become extremely laggy after 50+ tool calls.
+- To continue in a new conversation, ask ChatGPT to use `create_handoff`. CatDesk returns a workspace-specific `catdesk_handoff_<workspace-name>_<short-id>.md` filename and Markdown content describing the goal, progress, decisions, validation, next steps and current Git state. **Preparing the handoff does not save it to Library:** ChatGPT must save the returned artifact with its Library tools. The next session searches persistent Library using the complete workspace identity prefix, reads the matching handoff, verifies it against the workspace and deletes only the successfully read handoff. Multiple matches require choosing the intended file. Library Search and write access are required for this workflow; CatDesk does not write a handoff into the repository. Do not include credentials or secrets. A handoff preserves context, not uncommitted files or running jobs.
 <p align="center">
   <img src="docs/images/high_ram_usage.png" alt="3.9 GB Memory usage🥹" width="300"><br>
   <em>3.9 GB Memory usage🥹</em>
@@ -213,13 +213,14 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # Tools
 
-CatDesk has two local tool modes: `multi-tools` exposes 10 tools, and `read-only` exposes 3 tools.
+CatDesk has two local tool modes: `multi-tools` exposes 11 tools, and `read-only` exposes 4 tools. `create_handoff` is available in both because it does not change workspace files.
 
 CatDesk's local tools in `multi-tools` mode are:
 
 | Tool                  | Type  | What it does                                                               |
 | --------------------- | ----- | -------------------------------------------------------------------------- |
 | `catdesk_instruction` | Guide | Returns CatDesk usage instructions and render Binagotchy                   |
+| `create_handoff` | Read | Prepares a workspace-specific Markdown handoff for ChatGPT to save to Library |
 | `read`                | Read  | Reads one or more text files from the workspace                            |
 | `search`              | Read  | Searches workspace text with `rg`, `grep`, or built-in search              |
 | `write`               | Write | Creates or overwrites a file                                               |
@@ -343,6 +344,12 @@ CatDesk checks these locations for `AGENTS.md` in this order. This happens every
 This is a bug on ChatGPT's side. There is nothing I can do about it, and changing the code will not solve the issue. This bug was probably introduced on Apr 15th.
 
 # Safety
+
+## Linux command sandbox
+
+This fork prefers a trusted `bwrap` executable outside the workspace, rejecting non-executable candidates and symlinks resolving back into the workspace. Bubblewrap isolates user, PID, IPC, UTS and mount namespaces and hides the host temporary directory. Network access remains available for development tools. When no trusted `bwrap` exists, the existing Landlock backend is retained and must be fully enforced; a failing Bubblewrap command never falls back to unrestricted execution. CatDesk's process-tree owner remains responsible for job cancellation rather than tying jobs to a transient worker thread.
+
+SSH uses only a valid `SSH_AUTH_SOCK` and regular `.ssh/config`, `known_hosts`, `known_hosts2` and public-key files. Private keys, public-key symlinks and `.pub` directories are not added to the SSH read allowlist. The fork retains its explicit `.git-credentials` and `.config/gh/hosts.yml` read access for HTTPS Git authentication. Read-only credentials and access to an SSH Agent are still sensitive capabilities: do not run untrusted code with production credentials. Config files referring to excluded keys or additional include files are not automatically exposed.
 
 > [!CAUTION]
 > Do **NOT** share the `MCP Server URL` with anyone. Anyone with the URL can access your computer.
