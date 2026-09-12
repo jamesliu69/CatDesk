@@ -5,3 +5,6 @@ log_old.txt
 
 .omo/
 .worktrees/
+/.omo
+/.omc
+/.logs
