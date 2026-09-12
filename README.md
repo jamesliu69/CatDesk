@@ -133,6 +133,8 @@ If you don't want to use CatDesk, here are some similar projects you can try:
 
    By default, CatDesk listens only on `127.0.0.1:3200`. You can override the port with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
 
+   To connect the same ChatGPT account to both a Raspberry Pi and Windows, see [Windows + Cloudflare Tunnel dual CatDesk setup](docs/windows-cloudflare-catdesk.md).
+
    On the first launch from macOS Terminal.app, CatDesk asks whether you want to use its dedicated `CatDesk` Terminal profile and saves that choice to `~/.catdesk/config.toml`. If enabled and the current tab is not already using that profile, CatDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. Subsequent launches reuse the saved preference. Set `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` to temporarily keep the current Terminal session untouched regardless of the saved preference.
 
 3. Wait for the TUI to show the MCP Server URL.

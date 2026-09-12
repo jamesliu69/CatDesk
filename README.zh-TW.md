@@ -133,6 +133,8 @@ ChatGPT Web + CatDesk
 
    CatDesk 預設只監聽 `127.0.0.1:3200`。可以用 `PORT` 覆寫 port。Workspace root 預設為你啟動 CatDesk 時所在的目錄，也可以用 `WORKSPACE_ROOT` 覆寫。
 
+   如果要讓同一個 ChatGPT 帳號同時連接 Pi 5 與 Windows，請參考 [Windows + Cloudflare Tunnel 雙 CatDesk 設定](docs/windows-cloudflare-catdesk.md)。
+
    第一次從 macOS Terminal.app 啟動時，CatDesk 會詢問你是否要使用專用的 `CatDesk` Terminal profile，並把選擇儲存在 `~/.catdesk/config.toml`。如果啟用，而且目前分頁尚未使用該 profile，CatDesk 會套用它、關閉暫時建立的 helper window，並要求你在該分頁再次執行相同指令。之後啟動時會直接重用已儲存的偏好。設定 `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` 可以暫時保留目前的 Terminal session，不論已儲存的偏好為何。
 
 3. 等待 TUI 顯示 MCP Server URL。
