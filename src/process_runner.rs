@@ -388,12 +388,10 @@ fn shell_command(
     }
 }
 
-fn spawn_shell_command_blocking(
-    command: &str,
-    workspace_root: &Path,
+fn spawn_prepared_shell_command(
+    prepared: PreparedShellCommand,
     cwd: &Path,
 ) -> io::Result<SpawnedProcess> {
-    let prepared = shell_command(command, workspace_root, cwd)?;
     let mut shell = prepared.command;
     let mut cleanup_dir = prepared.cleanup_dir;
     shell
@@ -481,12 +479,19 @@ pub async fn spawn_shell_command(
 ) -> io::Result<SpawnedProcess> {
     let command = command.to_owned();
     let workspace_root = workspace_root.to_path_buf();
-    let cwd = cwd.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        spawn_shell_command_blocking(&command, &workspace_root, &cwd)
+    let cwd_for_prepare = cwd.to_path_buf();
+    let prepared = tokio::task::spawn_blocking(move || {
+        shell_command(&command, &workspace_root, &cwd_for_prepare)
     })
     .await
-    .map_err(|error| io::Error::other(format!("command spawn task failed: {error}")))?
+    .map_err(|error| io::Error::other(format!("command preparation task failed: {error}")))??;
+
+    // Keep the actual process spawn on a Tokio runtime worker rather than a
+    // spawn_blocking worker. Linux bubblewrap uses --die-with-parent, whose
+    // PR_SET_PDEATHSIG parent is the specific thread that created the process.
+    // Tokio retires idle blocking workers, so spawning bwrap there can kill an
+    // otherwise healthy long-running command when that worker exits.
+    spawn_prepared_shell_command(prepared, cwd)
 }
 
 #[derive(Debug)]
@@ -712,6 +717,54 @@ mod tests {
         let path = std::env::temp_dir().join(format!("catdesk-process-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_death_signal_child_outlives_blocking_worker_retirement() {
+        use std::os::unix::process::CommandExt;
+
+        let root = workspace("blocking-worker-parent");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_keep_alive(std::time::Duration::from_millis(50))
+            .enable_all()
+            .build()
+            .expect("build regression-test runtime");
+
+        runtime.block_on(async {
+            let prepared = tokio::task::spawn_blocking(|| {
+                let mut command = Command::new("/bin/bash");
+                command.arg("-c").arg("sleep 0.25; printf 'survived\\n'");
+                unsafe {
+                    command.as_std_mut().pre_exec(|| {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                PreparedShellCommand {
+                    command,
+                    cleanup_dir: None,
+                }
+            })
+            .await
+            .expect("prepare task joined");
+
+            let mut process = spawn_prepared_shell_command(prepared, &root).expect("spawn command");
+            let stdout = process.take_stdout().expect("command stdout");
+            let output_task = tokio::spawn(capture_reader(stdout, 1024));
+            let status = process.wait().await.expect("wait for command");
+            process.disarm().await;
+            let output = output_task.await.expect("join stdout capture");
+
+            assert!(status.success(), "command was killed: {status}");
+            assert_eq!(output.text.trim(), "survived");
+        });
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
