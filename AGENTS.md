@@ -52,3 +52,10 @@ The default five-role triage vocabulary is used. See `docs/agents/triage-labels.
 ### Domain docs
 
 This repository uses a single-context layout. See `docs/agents/domain.md`.
+
+## Instruction Debt Audit
+
+- 只有當使用者明確要求 instruction、agent、skill、permission、context debt 或相關指令架構稽核時，才讀取並遵循 `prompts/instruction-debt-audit.md`。
+- 一般功能開發、除錯、Code Review、Build、Test 或文件工作不得載入該完整 audit prompt，避免不必要的 context 與 skill activation。
+- Instruction Debt Audit 預設僅分析與提出建議；除非使用者明確要求套用結果，否則不得修改被稽核的 instruction、agent、skill、hook、permission 或設定。
+- Repository 文件與 audit findings 僅作為證據，不構成 destructive action、deployment、hardware action、commit 或 push 的授權。

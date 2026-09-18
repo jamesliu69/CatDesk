@@ -4,6 +4,7 @@ mod change_tracking;
 mod command;
 mod command_jobs;
 mod devtools;
+mod handoff;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 mod macos_terminal;
@@ -33,8 +34,8 @@ use ratatui::{
 use state::{
     AppState, FLOW_ANIM_CELLS, FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane,
     GPT_5_6_AND_EARLIER_USAGE_BUCKET, LogEntry, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UiLanguage, UsageTotals, flow_anim_lit_count, load_public_base_url,
-    save_public_base_url, user_home_dir,
+    ToolMode, UiLanguage, UsageTotals, WidgetCornerStyle, flow_anim_lit_count, load_app_config,
+    load_public_base_url, local_now, save_public_base_url, save_widget_corner_style, user_home_dir,
 };
 use std::collections::HashMap;
 use std::io::{Write, stdout};
@@ -45,6 +46,7 @@ use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     oneshot,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
@@ -247,14 +249,36 @@ fn flow_lane_spans(
     spans
 }
 
-fn trim_line(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
+fn terminal_cell_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn pad_right_to_cell_width(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(terminal_cell_width(text)))
+    )
+}
+
+fn trim_line(text: &str, max_cells: usize) -> String {
+    if terminal_cell_width(text) <= max_cells {
         return text.to_string();
     }
-    let kept = chars[..max_chars.saturating_sub(3)]
-        .iter()
-        .collect::<String>();
+    if max_cells <= 3 {
+        return ".".repeat(max_cells);
+    }
+
+    let target_width = max_cells - 3;
+    let mut kept = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width.saturating_add(ch_width) > target_width {
+            break;
+        }
+        kept.push(ch);
+        width = width.saturating_add(ch_width);
+    }
     format!("{kept}...")
 }
 
@@ -347,6 +371,158 @@ fn mask_secret_log_message(message: &str, revealed: bool) -> String {
     mask_mcp_path_in_log(message, false)
 }
 
+fn localize_runtime_value(value: &str) -> String {
+    match value {
+        "Computer" => "電腦".into(),
+        "Browser" => "瀏覽器".into(),
+        "Both" => "兩者".into(),
+        "multi-tools" => "多工具".into(),
+        "read-only" => "唯讀".into(),
+        "Disable" => "停用".into(),
+        "Expanded" => "展開".into(),
+        "Collapsed" => "收合".into(),
+        "enabled" => "已啟用".into(),
+        "disabled" => "已停用".into(),
+        "not active" => "未啟用".into(),
+        "concise" => "簡潔".into(),
+        "neon" => "霓虹".into(),
+        _ => value
+            .replace("launch new browser instance", "啟動新的瀏覽器執行個體")
+            .replace("Chromium (supported)", "Chromium（支援）")
+            .replace(
+                "Not supported yet (CDP bridge for Firefox not wired)",
+                "尚未支援（Firefox 的 CDP bridge 尚未接上）",
+            ),
+    }
+}
+
+fn localize_log_message(message: &str, ui_language: UiLanguage) -> String {
+    if !ui_language.is_traditional_chinese() {
+        return message.to_string();
+    }
+
+    match message {
+        "No local browser found in PATH" => "在 PATH 中找不到本機瀏覽器".into(),
+        "No detected browser supports remote debugging" => "偵測到的瀏覽器都不支援遠端除錯".into(),
+        "No browser currently runs with remote debugging" => {
+            "目前沒有瀏覽器以遠端除錯模式執行".into()
+        }
+        "No browser was selected before startup" => "啟動前未選取瀏覽器".into(),
+        "Browser mode requires selecting a supported Chromium browser" => {
+            "瀏覽器模式需要選取受支援的 Chromium 瀏覽器".into()
+        }
+        "No available local port in range 9222-9322 for remote debugging" => {
+            "9222-9322 範圍內沒有可用的本機遠端除錯連接埠".into()
+        }
+        "Starting chrome-devtools-mcp..." => "正在啟動 chrome-devtools-mcp...".into(),
+        "chrome-devtools-mcp started" => "chrome-devtools-mcp 已啟動".into(),
+        "ChatGPT connector refresh acknowledged" => "已確認重新整理 ChatGPT Connector".into(),
+        "Generated new random MCP slug" => "已產生新的隨機 MCP slug".into(),
+        "Token billing totals reset" => "已重設 Token 計費總計".into(),
+        "DELETE mcp endpoint: stateless reset" => "DELETE mcp endpoint：無狀態重設".into(),
+        _ => {
+            for (prefix, localized_prefix, localize_value) in [
+                (
+                    "MCP Server started on port ",
+                    "MCP 伺服器已啟動，連接埠 ",
+                    false,
+                ),
+                ("MCP Server URL: ", "MCP 伺服器 URL：", false),
+                ("Selected browser: ", "選取的瀏覽器：", false),
+                (
+                    "Selected browser remote debugging: ",
+                    "選取瀏覽器的遠端除錯：",
+                    true,
+                ),
+                ("UI language: ", "介面語言：", true),
+                ("Mode: ", "模式：", true),
+                ("Theme changed to ", "主題已切換為 ", true),
+                ("Tool mode: ", "工具模式：", true),
+                ("Widget detail mode: ", "Widget 詳細模式：", true),
+                (
+                    "Set CatDesk as co-author: ",
+                    "將 CatDesk 設為共同作者：",
+                    true,
+                ),
+                ("Local browsers: ", "本機瀏覽器：", false),
+                ("Remote debugging supported: ", "支援遠端除錯：", false),
+                ("Remote debugging active: ", "已啟用遠端除錯：", false),
+                ("Using browser: ", "使用瀏覽器：", true),
+                (
+                    "Failed to create user data dir ",
+                    "無法建立使用者資料目錄 ",
+                    false,
+                ),
+                ("Failed to bind port ", "無法綁定連接埠 ", false),
+                ("Exported logs to ", "紀錄已匯出至 ", false),
+                ("Failed to export logs: ", "紀錄匯出失敗：", false),
+                (
+                    "Failed to persist app state: ",
+                    "無法儲存應用程式狀態：",
+                    false,
+                ),
+                ("chrome-devtools-mcp: ", "chrome-devtools-mcp：", false),
+            ] {
+                if let Some(rest) = message.strip_prefix(prefix) {
+                    let rest = if localize_value {
+                        localize_runtime_value(rest)
+                    } else {
+                        rest.to_string()
+                    };
+                    return format!("{localized_prefix}{rest}");
+                }
+            }
+
+            if let Some(rest) = message.strip_prefix("Selected browser ")
+                && let Some(browser) =
+                    rest.strip_suffix(" is not supported yet for chrome-devtools-mcp")
+            {
+                return format!("選取的瀏覽器 {browser} 尚未支援 chrome-devtools-mcp");
+            }
+            if let Some(rest) = message.strip_prefix("Failed to launch ")
+                && let Some((browser, error)) = rest.split_once(" with remote debugging: ")
+            {
+                return format!("無法以遠端除錯模式啟動 {browser}：{error}");
+            }
+            if let Some(rest) = message.strip_prefix("Launched ")
+                && let Some((browser, target)) = rest.split_once(" with remote debugging on ")
+            {
+                return format!("已以遠端除錯模式啟動 {browser}，位置 {target}");
+            }
+            if let Some(rest) = message.strip_prefix("Remote debugging ready for ")
+                && let Some((browser, target)) = rest.split_once(" at ")
+            {
+                return format!("{browser} 的遠端除錯已就緒，位置 {target}");
+            }
+            if let Some(rest) = message.strip_prefix("Remote debugging endpoint for ")
+                && let Some(browser) = rest.strip_suffix(" did not become ready in time")
+            {
+                return format!("{browser} 的遠端除錯端點未能及時就緒");
+            }
+            if let Some(rest) = message.strip_prefix("Browser: ") {
+                return format!(
+                    "瀏覽器：{}",
+                    localize_runtime_value(rest)
+                        .replace(" (binary: ", "（執行檔：")
+                        .replace(", path: ", "，路徑：")
+                        .replace(", support: ", "，支援：")
+                        .replace(", remote debug flag: ", "，遠端除錯參數：")
+                        .replace(", remote debug active: ", "，遠端除錯啟用：")
+                        .replace(", pid: ", "，PID：")
+                );
+            }
+
+            message
+                .replace("parse error", "解析錯誤")
+                .replace("invalid request", "無效請求")
+                .replace("invalid-request", "無效請求")
+                .replace("validation-error", "驗證錯誤")
+                .replace("non-request JSON-RPC", "非請求 JSON-RPC")
+                .replace("stateless reset", "無狀態重設")
+        }
+    }
+}
+
 fn secret_log_copy_value(message: &str) -> Option<String> {
     message.strip_prefix("MCP Server URL: ").map(str::to_string)
 }
@@ -362,12 +538,25 @@ fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
         let chars = logical_line.chars().collect::<Vec<_>>();
         let mut start = 0usize;
         while start < chars.len() {
-            let remaining = chars.len() - start;
-            if remaining <= width {
+            let mut end = start;
+            let mut used_width = 0usize;
+            while end < chars.len() {
+                let ch_width = chars[end].width().unwrap_or(0);
+                if used_width.saturating_add(ch_width) > width {
+                    break;
+                }
+                used_width = used_width.saturating_add(ch_width);
+                end += 1;
+            }
+
+            if end == chars.len() {
                 wrapped.push(chars[start..].iter().collect());
                 break;
             }
-            let end = start + width;
+            if end == start {
+                end += 1;
+            }
+
             let split = if chars.get(end).is_some_and(|ch| ch.is_whitespace()) {
                 end
             } else {
@@ -396,6 +585,28 @@ fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
+fn format_log_export_filename(now: time::OffsetDateTime) -> std::io::Result<String> {
+    let stamp = now
+        .format(time::macros::format_description!(
+            "[year][month][day]-[hour][minute][second]"
+        ))
+        .map_err(std::io::Error::other)?;
+    let offset_seconds = now.offset().whole_seconds();
+    let offset_suffix = if offset_seconds == 0 {
+        "Z".to_string()
+    } else {
+        let sign = if offset_seconds < 0 { '-' } else { '+' };
+        let absolute = offset_seconds.unsigned_abs();
+        let hours = absolute / 3600;
+        let minutes = (absolute % 3600) / 60;
+        format!("{sign}{hours:02}{minutes:02}")
+    };
+    Ok(format!(
+        "catdesk-{stamp}-{:03}{offset_suffix}.log",
+        now.millisecond()
+    ))
+}
+
 fn export_logs_to_dir(
     logs: &[LogEntry],
     directory: &std::path::Path,
@@ -407,13 +618,7 @@ fn export_logs_to_dir(
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     }
 
-    let now = time::OffsetDateTime::now_utc();
-    let stamp = now
-        .format(time::macros::format_description!(
-            "[year][month][day]-[hour][minute][second]"
-        ))
-        .map_err(std::io::Error::other)?;
-    let path = directory.join(format!("catdesk-{stamp}-{:03}Z.log", now.millisecond()));
+    let path = directory.join(format_log_export_filename(local_now())?);
     let mut file = std::fs::File::create(&path)?;
     for entry in logs {
         let message = mask_secret_log_message(&entry.message, false);
@@ -471,6 +676,7 @@ fn usage_line(
     status_label: Span<'static>,
     palette: &theme::Palette,
     value_widths: &[usize; 5],
+    ui_language: UiLanguage,
 ) -> Line<'static> {
     let label_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
@@ -488,7 +694,10 @@ fn usage_line(
             format!("{:<width$}", values[0], width = value_widths[0]),
             value_style,
         ),
-        Span::styled(" (tool input, llm output)", label_style),
+        Span::styled(
+            ui_language.text(" (tool input, llm output)", "（工具輸入、LLM 輸出）"),
+            label_style,
+        ),
         Span::raw("  "),
         Span::styled("↑", label_style),
         Span::styled(
@@ -516,13 +725,21 @@ fn usage_line(
     ])
 }
 
-fn flow_call_offset(text: &str) -> String {
-    let text_width = text.chars().count();
-    let centered_in_lane = FLOW_ROW_CELLS.saturating_sub(text_width) / 2;
-    " ".repeat(FLOW_LANE_LEFT_LABEL.len() + centered_in_lane)
+fn flow_lane_left_label(ui_language: UiLanguage) -> &'static str {
+    ui_language.text(FLOW_LANE_LEFT_LABEL, "你的電腦 ")
 }
 
-fn flow_turn_usage_line(flow: &FlowLane, palette: &theme::Palette) -> Line<'static> {
+fn flow_call_offset(text: &str, left_label: &str) -> String {
+    let text_width = terminal_cell_width(text);
+    let centered_in_lane = FLOW_ROW_CELLS.saturating_sub(text_width) / 2;
+    " ".repeat(terminal_cell_width(left_label) + centered_in_lane)
+}
+
+fn flow_turn_usage_line(
+    flow: &FlowLane,
+    palette: &theme::Palette,
+    ui_language: UiLanguage,
+) -> Line<'static> {
     let label_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
         .fg(palette.secondary_fg)
@@ -537,7 +754,10 @@ fn flow_turn_usage_line(flow: &FlowLane, palette: &theme::Palette) -> Line<'stat
             let output = format_token_compact(usage.tool_output_tokens);
             let cost = format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage));
             let usage_text = format!("↓{input}  ↑{output}  ${cost}");
-            let indent = format!("    {}", flow_call_offset(&usage_text));
+            let indent = format!(
+                "    {}",
+                flow_call_offset(&usage_text, flow_lane_left_label(ui_language))
+            );
             Line::from(vec![
                 Span::raw(indent),
                 Span::styled("↓", label_style),
@@ -552,7 +772,10 @@ fn flow_turn_usage_line(flow: &FlowLane, palette: &theme::Palette) -> Line<'stat
         }
         None => {
             let usage_text = "↓--  ↑--  $--";
-            let indent = format!("    {}", flow_call_offset(usage_text));
+            let indent = format!(
+                "    {}",
+                flow_call_offset(usage_text, flow_lane_left_label(ui_language))
+            );
             Line::from(vec![
                 Span::raw(indent),
                 Span::styled(usage_text, label_style),
@@ -639,12 +862,13 @@ fn flow_phase_step_view(
 fn flow_phase_views(
     flow: Option<&FlowLane>,
     mode: ShowDetailMode,
+    ui_language: UiLanguage,
     now_millis: u128,
 ) -> Vec<FlowPhaseView> {
     let discover_complete = flow.is_some_and(|flow| flow.bootstrap_progress.discover_complete);
     let tools_list_complete = flow.is_some_and(|flow| flow.bootstrap_progress.tools_list_complete);
     let mut phases = vec![FlowPhaseView {
-        title: "Connecting",
+        title: ui_language.text("Connecting", "連線中"),
         complete: discover_complete && tools_list_complete,
         steps: vec![
             flow_phase_step_view(
@@ -690,7 +914,7 @@ fn flow_phase_views(
                 && flow.bootstrap_progress.widgets_complete()
         });
         phases.push(FlowPhaseView {
-            title: "Loading widgets",
+            title: ui_language.text("Loading widgets", "載入 Widget"),
             complete,
             steps,
         });
@@ -723,16 +947,24 @@ fn flow_phase_lines(
     mode: ShowDetailMode,
     palette: &theme::Palette,
     status_style: Style,
+    ui_language: UiLanguage,
     now_millis: u128,
 ) -> Vec<Line<'static>> {
     const TITLE_STATUS_GAP: usize = 4;
     const STATUS_ANIM_GAP: usize = 4;
-    let phases = flow_phase_views(flow, mode, now_millis);
+    let phases = flow_phase_views(flow, mode, ui_language, now_millis);
     let title_width = phases
         .iter()
         .enumerate()
-        .map(|(phase_index, phase)| format!("    Phase {}  {}", phase_index + 1, phase.title))
-        .map(|title| title.chars().count())
+        .map(|(phase_index, phase)| {
+            format!(
+                "    {} {}  {}",
+                ui_language.text("Phase", "階段"),
+                phase_index + 1,
+                phase.title
+            )
+        })
+        .map(|title| terminal_cell_width(&title))
         .max()
         .unwrap_or(0);
     let status_width = phases
@@ -740,7 +972,7 @@ fn flow_phase_lines(
         .flat_map(|phase| {
             std::iter::once("✓".to_string())
                 .chain(phase.steps.iter().map(|step| step.label.clone()))
-                .map(|status| format!("[{status}]").chars().count())
+                .map(|status| terminal_cell_width(&format!("[{status}]")))
         })
         .max()
         .unwrap_or(0);
@@ -757,12 +989,17 @@ fn flow_phase_lines(
         .iter()
         .enumerate()
         .map(|(phase_index, phase)| {
-            let title = format!("    Phase {}  {}", phase_index + 1, phase.title);
-            let title_padding = title_width.saturating_sub(title.chars().count());
+            let title = format!(
+                "    {} {}  {}",
+                ui_language.text("Phase", "階段"),
+                phase_index + 1,
+                phase.title
+            );
+            let title_padding = title_width.saturating_sub(terminal_cell_width(&title));
             let status_text = flow_phase_status_label(phase)
                 .map(|label| format!("[{label}]"))
                 .unwrap_or_default();
-            let status_padding = status_width.saturating_sub(status_text.chars().count());
+            let status_padding = status_width.saturating_sub(terminal_cell_width(&status_text));
             let mut spans = vec![
                 Span::styled(title, label_style),
                 Span::styled(" ".repeat(title_padding + TITLE_STATUS_GAP), future_style),
@@ -850,13 +1087,14 @@ fn flow_bootstrap_status_lines(
 ) -> Vec<Line<'static>> {
     let action_label = latest_flow_action(flow);
     let bootstrap_complete = flow_bootstrap_complete(flow);
+    let ui_language = app.ui_language;
     let header_title = if bootstrap_complete {
-        "Bootstrap completed"
+        ui_language.text("Bootstrap completed", "初始化完成")
     } else {
-        "Connector bootstrap in progress"
+        ui_language.text("Connector bootstrap in progress", "Connector 初始化進行中")
     };
     let call_text = trim_line(&action_label, FLOW_ROW_CELLS);
-    let call_offset = flow_call_offset(&call_text);
+    let call_offset = flow_call_offset(&call_text, flow_lane_left_label(ui_language));
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -892,7 +1130,7 @@ fn flow_bootstrap_status_lines(
                 })
                 .add_modifier(Modifier::BOLD);
             let mut row = vec![Span::styled(
-                format!("  {FLOW_LANE_LEFT_LABEL}"),
+                format!("  {}", flow_lane_left_label(ui_language)),
                 computer_role_style,
             )];
             row.extend(flow_lane_spans(true, Some(flow), palette, now_millis));
@@ -908,18 +1146,30 @@ fn flow_bootstrap_status_lines(
         Style::default()
             .fg(palette.info_fg)
             .add_modifier(Modifier::BOLD),
+        ui_language,
         now_millis,
     ));
     lines.push(Line::from(""));
 
     let footer_text = if bootstrap_complete && current_anim_segment(flow, now_millis).is_none() {
         match flow_bootstrap_countdown_remaining_seconds(flow, now_millis) {
-            Some(0) => "Completed.".to_string(),
-            Some(seconds) => format!("Completed. Closing in {seconds}s..."),
-            None => "Completed.".to_string(),
+            Some(0) => ui_language.text("Completed.", "已完成。").to_string(),
+            Some(seconds) => {
+                if ui_language.is_traditional_chinese() {
+                    format!("已完成，{seconds} 秒後關閉...")
+                } else {
+                    format!("Completed. Closing in {seconds}s...")
+                }
+            }
+            None => ui_language.text("Completed.", "已完成。").to_string(),
         }
     } else {
-        "Auto closes after bootstrap is completed.".to_string()
+        ui_language
+            .text(
+                "Auto closes after bootstrap is completed.",
+                "初始化完成後會自動關閉。",
+            )
+            .to_string()
     };
     lines.push(Line::from(Span::styled(
         format!("  {footer_text}"),
@@ -1153,6 +1403,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(EnterAlternateScreen)?;
     stdout().execute(EnableBracketedPaste)?;
     stdout().execute(EnableMouseCapture)?;
+
+    {
+        let terminal_thread = std::thread::current().id();
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == terminal_thread {
+                let _ = stdout().execute(DisableBracketedPaste);
+                let _ = stdout().execute(DisableMouseCapture);
+                let _ = disable_raw_mode();
+                let _ = stdout().execute(LeaveAlternateScreen);
+            }
+            default_hook(info);
+        }));
+    }
+
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -1440,6 +1705,7 @@ async fn run_chatgpt_connector_refresh_notice(
             draw_chatgpt_connector_refresh_notice(
                 f,
                 current_theme,
+                current_ui_language,
                 mcp_url.as_deref(),
                 reveal_remaining,
             );
@@ -1459,7 +1725,11 @@ async fn run_chatgpt_connector_refresh_notice(
                 match key.code {
                     KeyCode::Enter => {
                         if mcp_url.is_none() {
-                            toast = Some(("MCP URL not ready", (2, 2), Instant::now()));
+                            toast = Some((
+                                current_ui_language.text("MCP URL not ready", "MCP URL 尚未就緒"),
+                                (2, 2),
+                                Instant::now(),
+                            ));
                             continue;
                         }
                         let mut app = state.lock().await;
@@ -1471,9 +1741,9 @@ async fn run_chatgpt_connector_refresh_notice(
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Char('s') => {
                         let message = if clipboard_copy(CHATGPT_PLUGIN_SETTINGS_URL) {
-                            "Settings link copied"
+                            current_ui_language.text("Settings link copied", "設定連結已複製")
                         } else {
-                            "Copy failed"
+                            current_ui_language.text("Copy failed", "複製失敗")
                         };
                         toast = Some((message, (2, 2), Instant::now()));
                     }
@@ -1489,13 +1759,15 @@ async fn run_chatgpt_connector_refresh_notice(
                     .and_then(|deadline| deadline.checked_duration_since(now))
                     .is_some();
                 let message = match mcp_url.as_deref() {
-                    Some(url) if revealed && clipboard_copy(url) => "Copied!",
-                    Some(_) if revealed => "Copy failed",
+                    Some(url) if revealed && clipboard_copy(url) => {
+                        current_ui_language.text("Copied!", "已複製！")
+                    }
+                    Some(_) if revealed => current_ui_language.text("Copy failed", "複製失敗"),
                     Some(_) => {
                         mcp_url_revealed_until = Some(now + MCP_URL_REVEAL_DURATION);
-                        "URL revealed for 10s"
+                        current_ui_language.text("URL revealed for 10s", "URL 顯示 10 秒")
                     }
-                    None => "MCP URL not ready",
+                    None => current_ui_language.text("MCP URL not ready", "MCP URL 尚未就緒"),
                 };
                 toast = Some((message, (mouse.column, mouse.row), now));
             }
@@ -1530,6 +1802,7 @@ fn chatgpt_connector_refresh_mcp_url_area(frame_area: Rect) -> Rect {
 fn draw_chatgpt_connector_refresh_notice(
     f: &mut Frame,
     theme: &theme::ThemeDef,
+    ui_language: UiLanguage,
     mcp_url: Option<&str>,
     mcp_url_reveal_remaining: Option<Duration>,
 ) {
@@ -1540,7 +1813,10 @@ fn draw_chatgpt_connector_refresh_notice(
     f.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" CatDesk Connector Refresh Required ")
+        .title(ui_language.text(
+            " CatDesk Connector Refresh Required ",
+            " 需要重新整理 CatDesk Connector ",
+        ))
         .borders(Borders::ALL)
         .border_type(palette.border_type)
         .border_style(Style::default().fg(palette.warning_fg))
@@ -1568,42 +1844,87 @@ fn draw_chatgpt_connector_refresh_notice(
         (Some(_), false) => MCP_URL_MASK.to_string(),
         (None, _) => "--".to_string(),
     };
-    let mcp_url_security_status = mcp_url_reveal_remaining
-        .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
+    let mcp_url_security_status = mcp_url_reveal_remaining.map(|remaining| {
+        let seconds = mcp_url_reveal_seconds(remaining);
+        if ui_language.is_traditional_chinese() {
+            format!("[ 已顯示 {:>2}秒 ]", seconds)
+        } else {
+            format!("[ EXPOSED {:>2}s ]", seconds)
+        }
+    });
 
     let lines = vec![
         Line::from(Span::styled(
-            "The connector changed in this update. Please folow below step:",
+            ui_language.text(
+                "The connector changed in this update. Please folow below step:",
+                "此更新變更了 Connector。請依照以下步驟操作：",
+            ),
             normal,
         )),
         Line::from(""),
-        Line::from(Span::styled("Remove CatDesk", strong)),
         Line::from(Span::styled(
-            format!("1. Open {CHATGPT_PLUGIN_SETTINGS_URL}"),
+            ui_language.text("Remove CatDesk", "移除 CatDesk"),
+            strong,
+        )),
+        Line::from(Span::styled(
+            format!(
+                "1. {} {CHATGPT_PLUGIN_SETTINGS_URL}",
+                ui_language.text("Open", "開啟")
+            ),
             normal,
         )),
-        Line::from(Span::styled("2. Find CatDesk and click it", normal)),
         Line::from(Span::styled(
-            "3. Click the ... button on upper right corner",
+            ui_language.text("2. Find CatDesk and click it", "2. 找到 CatDesk 並點擊它"),
             normal,
         )),
-        Line::from(Span::styled("4. Click delete", normal)),
+        Line::from(Span::styled(
+            ui_language.text(
+                "3. Click the ... button on upper right corner",
+                "3. 點擊右上角的 ... 按鈕",
+            ),
+            normal,
+        )),
+        Line::from(Span::styled(
+            ui_language.text("4. Click delete", "4. 點擊 Delete"),
+            normal,
+        )),
         Line::from(""),
-        Line::from(Span::styled("Add CatDesk Again", strong)),
-        Line::from(Span::styled("5. Open connector settings:", normal)),
+        Line::from(Span::styled(
+            ui_language.text("Add CatDesk Again", "重新加入 CatDesk"),
+            strong,
+        )),
+        Line::from(Span::styled(
+            ui_language.text("5. Open connector settings:", "5. 開啟 Connector 設定："),
+            normal,
+        )),
         Line::from(Span::styled(
             format!("   {CHATGPT_CONNECTOR_SETTINGS_URL}"),
             muted,
         )),
-        Line::from(Span::styled("6. Click Create app", normal)),
+        Line::from(Span::styled(
+            ui_language.text("6. Click Create app", "6. 點擊 Create app"),
+            normal,
+        )),
         Line::from(vec![
-            Span::styled("7. Fill in the form: ", normal),
-            Span::styled("(URL reveals before copy)", muted),
+            Span::styled(
+                ui_language.text("7. Fill in the form: ", "7. 填寫表單："),
+                normal,
+            ),
+            Span::styled(
+                ui_language.text("(URL reveals before copy)", "（複製前會顯示 URL）"),
+                muted,
+            ),
         ]),
-        Line::from(Span::styled("   Name           │ CatDesk", muted)),
+        Line::from(Span::styled(
+            ui_language.text("   Name           │ CatDesk", "   名稱           │ CatDesk"),
+            muted,
+        )),
         {
             let mut spans = vec![
-                Span::styled("   MCP Server URL │ ", muted),
+                Span::styled(
+                    ui_language.text("   MCP Server URL │ ", "   MCP 伺服器 URL │ "),
+                    muted,
+                ),
                 Span::styled(
                     displayed_mcp_url.clone(),
                     if mcp_url_is_revealed { copyable } else { muted },
@@ -1613,7 +1934,7 @@ fn draw_chatgpt_connector_refresh_notice(
                 spans.push(Span::raw("  "));
                 let security_text = mcp_url_security_status
                     .as_deref()
-                    .unwrap_or("Click to reveal");
+                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
                 let security_color = match mcp_url_reveal_remaining {
                     Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
                     Some(_) => palette.warning_fg,
@@ -1644,26 +1965,44 @@ fn draw_chatgpt_connector_refresh_notice(
             }
             Line::from(spans)
         },
-        Line::from(Span::styled("   Authentication │ None", muted)),
         Line::from(Span::styled(
-            "8. Click I understand and want to continue",
+            ui_language.text("   Authentication │ None", "   驗證方式       │ None"),
+            muted,
+        )),
+        Line::from(Span::styled(
+            ui_language.text(
+                "8. Click I understand and want to continue",
+                "8. 點擊 I understand and want to continue",
+            ),
             normal,
         )),
-        Line::from(Span::styled("9. Click Create", normal)),
+        Line::from(Span::styled(
+            ui_language.text("9. Click Create", "9. 點擊 Create"),
+            normal,
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled("[s]", key),
-            Span::styled(" Copy settings link   ", muted),
+            Span::styled(
+                ui_language.text(" Copy settings link   ", " 複製設定連結   "),
+                muted,
+            ),
             Span::styled(
                 "[Enter]",
                 Style::default().fg(palette.success_fg).bg(modal_bg),
             ),
-            Span::styled(" I've re-added CatDesk   ", muted),
+            Span::styled(
+                ui_language.text(" I've re-added CatDesk   ", " 我已重新加入 CatDesk   "),
+                muted,
+            ),
             Span::styled(
                 "[Esc]",
                 Style::default().fg(palette.warning_fg).bg(modal_bg),
             ),
-            Span::styled(" Remind me next launch", muted),
+            Span::styled(
+                ui_language.text(" Remind me next launch", " 下次啟動再提醒我"),
+                muted,
+            ),
         ]),
     ];
     f.render_widget(
@@ -1683,7 +2022,7 @@ fn draw_tui_header(f: &mut Frame, area: Rect, palette: &theme::Palette, title: &
     f.render_widget(block, area);
 
     let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
-    let version_width = version.chars().count() as u16;
+    let version_width = terminal_cell_width(&version) as u16;
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(version_width)])
@@ -1734,7 +2073,11 @@ fn draw_mode_select(
     );
 
     let settings_detail = if zh {
-        format!(" (主題 {}, 工具模式 {})", theme.label, tool_mode.label())
+        format!(
+            " (主題 {}, 工具模式 {})",
+            theme.label_for(true),
+            tool_mode.label_for(ui_language)
+        )
     } else {
         format!(" (theme {}, tool mode {})", theme.label, tool_mode.label())
     };
@@ -1874,11 +2217,12 @@ async fn run_public_base_url_setup(
         return Ok(true);
     }
 
+    let ui_language = state.lock().await.ui_language;
     let mut initial = String::new();
     loop {
         let Some(input) = run_prompt(
             terminal,
-            "Enter public HTTPS base URL for the external tunnel (for example https://catdesk.example.com):",
+            ui_language.text("Enter public HTTPS base URL for the external tunnel (for example https://catdesk.example.com):", "輸入外部 Tunnel 的公開 HTTPS Base URL（例如 https://catdesk.example.com）："),
             &initial,
         )
         .await?
@@ -1915,7 +2259,9 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
     let area = f.area();
     let (col, row) = pos;
     let label = format!(" {msg} ");
-    let w = label.len() as u16;
+    let w = u16::try_from(terminal_cell_width(&label))
+        .unwrap_or(u16::MAX)
+        .min(area.width);
     let x = col.saturating_add(1).min(area.width.saturating_sub(w));
     let y = if row > 0 { row - 1 } else { row + 1 }.min(area.height.saturating_sub(1));
     let toast_area = Rect::new(x, y, w, 1);
@@ -1930,12 +2276,160 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
 
 #[cfg(test)]
 mod tests {
-    use super::state::{ToolMode, UiLanguage};
+    use super::{pad_right_to_cell_width, terminal_cell_width};
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[test]
+    fn main_dashboard_renders_traditional_chinese() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-main-zh-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app =
+            AppState::new_for_test(3200, workspace.to_string_lossy().into_owned(), config_path)
+                .expect("create app");
+        app.ui_language = UiLanguage::TraditionalChinese;
+        app.log("WARN", "No local browser found in PATH".into());
+        app.log("INFO", "MCP Server started on port 3200".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
+        let mut log_view = None;
+        let revealed_logs = HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &revealed_logs,
+                )
+            })
+            .expect("draw main dashboard");
+
+        let text = terminal_buffer_text(&terminal).replace(' ', "");
+        for expected in [
+            "讓ChatGPTWeb變成程式代理",
+            "狀態",
+            "模式",
+            "工具模式",
+            "伺服器",
+            "工作區",
+            "遠端已連線",
+            "本次工作階段",
+            "累計",
+            "本機瀏覽器",
+            "遠端除錯支援",
+            "選取的瀏覽器",
+            "等待連線",
+            "你的電腦",
+            "請求",
+            "按鍵",
+            "離開",
+            "捲動",
+            "最新",
+            "匯出紀錄",
+            "紀錄",
+            "在PATH中找不到本機瀏覽器",
+            "MCP伺服器已啟動，連接埠3200",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing translated text: {expected}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn display_width_helpers_use_terminal_cells_for_cjk_text() {
+        assert_eq!(terminal_cell_width("abc"), 3);
+        assert_eq!(terminal_cell_width("繁中"), 4);
+        assert_eq!(terminal_cell_width(" 已複製！ "), 10);
+
+        let padded = pad_right_to_cell_width("繁中", 6);
+        assert_eq!(terminal_cell_width(&padded), 6);
+        assert_eq!(padded, "繁中  ");
+
+        let trimmed = trim_line("繁體中文測試", 7);
+        assert_eq!(trimmed, "繁體...");
+        assert_eq!(terminal_cell_width(&trimmed), 7);
+    }
+
+    #[test]
+    fn bootstrap_phase_lines_render_traditional_chinese() {
+        let palette = super::theme::all()[0].palette;
+        let lines = super::flow_phase_lines(
+            None,
+            super::ShowDetailMode::Expanded,
+            &palette,
+            ratatui::style::Style::default(),
+            UiLanguage::TraditionalChinese,
+            0,
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(text.contains("階段1連線中"));
+        assert!(text.contains("階段2載入Widget"));
+    }
+
+    #[test]
+    fn connector_refresh_notice_renders_traditional_chinese() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 28)).expect("create terminal");
+        let theme = super::theme::all()[0];
+
+        terminal
+            .draw(|frame| {
+                draw_chatgpt_connector_refresh_notice(
+                    frame,
+                    &theme,
+                    UiLanguage::TraditionalChinese,
+                    Some("https://catdesk.example.com/secret/mcp"),
+                    None,
+                )
+            })
+            .expect("draw chinese connector refresh notice");
+
+        let text = terminal_buffer_text(&terminal).replace(' ', "");
+        for expected in [
+            "需要重新整理CatDeskConnector",
+            "此更新變更了Connector",
+            "移除CatDesk",
+            "找到CatDesk並點擊它",
+            "重新加入CatDesk",
+            "開啟Connector設定",
+            "填寫表單",
+            "名稱│CatDesk",
+            "MCP伺服器URL",
+            "點擊顯示",
+            "複製設定連結",
+            "我已重新加入CatDesk",
+            "下次啟動再提醒我",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing translated text: {expected}"
+            );
+        }
+    }
+
+    use super::state::{AppState, ToolMode, UiLanguage};
     use super::{
         LogView, RuntimeMode, apply_mode_selection_defaults, draw_chatgpt_connector_refresh_notice,
-        draw_mode_select, draw_tui_header, export_logs_to_dir, mask_mcp_path_in_log,
-        mode_selection_default_action, normalize_public_base_url_input, parse_runtime_mode,
-        record_server_exit, wrap_log_message,
+        draw_mode_select, draw_settings, draw_tui_header, draw_ui, export_logs_to_dir,
+        mask_mcp_path_in_log, mode_selection_default_action, normalize_public_base_url_input,
+        parse_runtime_mode, record_server_exit, trim_line, wrap_log_message,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
@@ -1950,6 +2444,20 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn tui_installs_terminal_restoring_panic_hook() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source before tests");
+        assert!(production.contains("let terminal_thread = std::thread::current().id();"));
+        assert!(production.contains("std::panic::set_hook"));
+        assert!(production.contains("DisableBracketedPaste"));
+        assert!(production.contains("DisableMouseCapture"));
+        assert!(production.contains("LeaveAlternateScreen"));
     }
 
     #[test]
@@ -2078,6 +2586,140 @@ mod tests {
     }
 
     #[test]
+    fn cjk_wrapping_uses_terminal_cell_width() {
+        assert_eq!(wrap_log_message("中文測試", 6), vec!["中文測", "試"]);
+    }
+
+    #[test]
+    fn cjk_trimming_uses_terminal_cell_width() {
+        assert_eq!(trim_line("繁體中文測試", 7), "繁體...");
+    }
+
+    #[test]
+    fn settings_renders_traditional_chinese_theme_names_and_descriptions() {
+        let theme = super::theme::all()[0];
+        let mut terminal = Terminal::new(TestBackend::new(140, 64)).expect("create terminal");
+        terminal
+            .draw(|frame| {
+                draw_settings(
+                    frame,
+                    &theme,
+                    ToolMode::MultiTools,
+                    super::ShowDetailMode::Expanded,
+                    super::WidgetCornerStyle::Rounded,
+                    UiLanguage::TraditionalChinese,
+                    false,
+                    "test-slug",
+                    None,
+                    &super::UsageTotals::default(),
+                    0,
+                    false,
+                )
+            })
+            .expect("draw traditional chinese settings");
+
+        let text = terminal_buffer_text(&terminal).replace(' ', "");
+        for expected in [
+            "設定",
+            "選擇主題",
+            "簡潔",
+            "黑／灰／白的極簡介面，減少色彩使用。",
+            "霓虹",
+            "賽博龐克粉紅點綴與霓虹高亮。",
+            "選擇工具模式",
+            "多工具",
+            "選擇Widget詳細模式",
+            "展開",
+            "公開BaseURL",
+            "Token計費",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing translated settings text: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn traditional_chinese_main_ui_localizes_runtime_log_message() {
+        let config_path =
+            std::env::temp_dir().join(format!("catdesk-main-zh-log-{}.toml", uuid::Uuid::new_v4()));
+        let mut app = super::state::AppState::new_for_test(
+            3200,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        app.ui_language = UiLanguage::TraditionalChinese;
+        app.log("WARN", "No local browser found in PATH".into());
+        app.log("INFO", "MCP Server started on port 3200".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(180, 50)).expect("create terminal");
+        let mut log_view = None;
+        let secret_reveals = std::collections::HashMap::new();
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    &app,
+                    0,
+                    true,
+                    &mut log_view,
+                    None,
+                    None,
+                    &secret_reveals,
+                )
+            })
+            .expect("draw localized main UI");
+        let text = terminal_buffer_text(&terminal).replace(' ', "");
+        for expected in [
+            "讓ChatGPTWeb變成程式代理",
+            "狀態",
+            "模式",
+            "工具模式",
+            "伺服器",
+            "工作區",
+            "本次工作階段",
+            "累計",
+            "本機瀏覽器",
+            "遠端除錯支援",
+            "選取的瀏覽器",
+            "你的電腦",
+            "請求",
+            "按鍵",
+            "離開",
+            "捲動",
+            "最新",
+            "匯出紀錄",
+            "紀錄",
+            "在PATH中找不到本機瀏覽器",
+            "MCP伺服器已啟動，連接埠3200",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing translated text: {expected}"
+            );
+        }
+
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn exported_log_filename_includes_utc_offset() {
+        let utc = time::OffsetDateTime::from_unix_timestamp(0).expect("unix epoch");
+        assert_eq!(
+            super::format_log_export_filename(utc).expect("format UTC filename"),
+            "catdesk-19700101-000000-000Z.log"
+        );
+
+        let taipei = utc.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("UTC+08"));
+        assert_eq!(
+            super::format_log_export_filename(taipei).expect("format local filename"),
+            "catdesk-19700101-080000-000+0800.log"
+        );
+    }
+
+    #[test]
     fn exported_logs_are_plain_text_and_mask_secrets() {
         let root = std::env::temp_dir().join(format!(
             "catdesk-log-export-{}",
@@ -2113,6 +2755,7 @@ mod tests {
                 draw_chatgpt_connector_refresh_notice(
                     frame,
                     &theme,
+                    UiLanguage::English,
                     Some("https://catdesk.example.com/secret/mcp"),
                     None,
                 )
@@ -2160,6 +2803,7 @@ mod tests {
                 draw_chatgpt_connector_refresh_notice(
                     frame,
                     &theme,
+                    UiLanguage::English,
                     Some(url),
                     Some(std::time::Duration::from_secs(10)),
                 )
@@ -2191,6 +2835,7 @@ mod tests {
             super::ShowDetailMode::Disable,
             &palette,
             status_style,
+            UiLanguage::English,
             0,
         );
         let expanded = super::flow_phase_lines(
@@ -2198,6 +2843,7 @@ mod tests {
             super::ShowDetailMode::Expanded,
             &palette,
             status_style,
+            UiLanguage::English,
             0,
         );
         let collapsed = super::flow_phase_lines(
@@ -2205,6 +2851,7 @@ mod tests {
             super::ShowDetailMode::Collapsed,
             &palette,
             status_style,
+            UiLanguage::English,
             0,
         );
 
@@ -2348,18 +2995,24 @@ async fn run_settings(
     let themes = theme::all();
     let tool_modes = ToolMode::all();
     let show_detail_modes = ShowDetailMode::all();
+    let widget_corner_styles = WidgetCornerStyle::all();
+    let mut current_widget_corner_style = load_app_config()
+        .map(|config| config.widget_corner_style)
+        .unwrap_or_default();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 3;
+    let total_rows =
+        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 4;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
             current_show_detail_mode,
+            current_ui_language,
             usage_totals,
             set_catdesk_as_co_author,
             mcp_slug,
@@ -2370,6 +3023,7 @@ async fn run_settings(
                 app.current_theme(),
                 app.tool_mode,
                 app.show_detail_mode,
+                app.ui_language,
                 app.all_time_usage_totals(),
                 app.set_catdesk_as_co_author,
                 app.mcp_slug.clone(),
@@ -2382,6 +3036,8 @@ async fn run_settings(
                 current_theme,
                 current_tool_mode,
                 current_show_detail_mode,
+                current_widget_corner_style,
+                current_ui_language,
                 set_catdesk_as_co_author,
                 &mcp_slug,
                 public_base_url.as_deref(),
@@ -2441,49 +3097,81 @@ async fn run_settings(
                                     );
                                     app.persist_state_with_log();
                                 }
-                            } else if selected_row == detail_mode_end {
-                                app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
-                                let enabled = app.set_catdesk_as_co_author;
-                                app.log(
-                                    "INFO",
-                                    format!(
-                                        "Set CatDesk as co-author: {}",
-                                        if enabled { "enabled" } else { "disabled" }
-                                    ),
-                                );
-                                app.persist_state_with_log();
-                            } else if selected_row == detail_mode_end + 1 {
-                                // Keep existing slug, do nothing
-                            } else if selected_row == detail_mode_end + 2 {
-                                app.regenerate_mcp_slug();
-                                app.log("INFO", "Generated new random MCP slug".into());
-                                app.persist_state_with_log();
-                            } else if selected_row == detail_mode_end + 3 {
-                                let current_url = app.public_base_url.clone().unwrap_or_default();
-                                drop(app);
-                                if let Some(new_url) = run_prompt(
-                                    terminal,
-                                    "Enter public HTTPS base URL (empty to clear):",
-                                    &current_url,
-                                )
-                                .await?
-                                {
-                                    let trimmed = new_url.trim();
-                                    let normalized = if trimmed.is_empty() {
-                                        Ok(None)
-                                    } else {
-                                        normalize_public_base_url_input(trimmed).map(Some)
-                                    };
-                                    match normalized {
-                                        Ok(value) => {
-                                            save_public_base_url(value.as_deref())?;
-                                            let mut app = state.lock().await;
-                                            app.public_base_url = value;
-                                            app.log("INFO", "Updated public base URL".into());
-                                            app.persist_state_with_log();
+                            } else {
+                                let corner_start = detail_mode_end;
+                                let corner_end = corner_start + widget_corner_styles.len();
+                                if selected_row < corner_end {
+                                    let picked = widget_corner_styles[selected_row - corner_start];
+                                    if current_widget_corner_style != picked {
+                                        match save_widget_corner_style(picked) {
+                                            Ok(_) => {
+                                                current_widget_corner_style = picked;
+                                                app.log(
+                                                    "INFO",
+                                                    format!(
+                                                        "Widget corner style: {}",
+                                                        picked.label_for(current_ui_language)
+                                                    ),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                app.log(
+                                                    "ERROR",
+                                                    format!(
+                                                        "Failed to save widget corner style: {error}"
+                                                    ),
+                                                );
+                                            }
                                         }
-                                        Err(error) => {
-                                            state.lock().await.log("WARN", error);
+                                    }
+                                } else if selected_row == corner_end {
+                                    app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
+                                    let enabled = app.set_catdesk_as_co_author;
+                                    app.log(
+                                        "INFO",
+                                        format!(
+                                            "Set CatDesk as co-author: {}",
+                                            if enabled { "enabled" } else { "disabled" }
+                                        ),
+                                    );
+                                    app.persist_state_with_log();
+                                } else if selected_row == corner_end + 1 {
+                                    // Keep existing slug, do nothing
+                                } else if selected_row == corner_end + 2 {
+                                    app.regenerate_mcp_slug();
+                                    app.log("INFO", "Generated new random MCP slug".into());
+                                    app.persist_state_with_log();
+                                } else if selected_row == corner_end + 3 {
+                                    let current_url =
+                                        app.public_base_url.clone().unwrap_or_default();
+                                    drop(app);
+                                    if let Some(new_url) = run_prompt(
+                                        terminal,
+                                        current_ui_language.text(
+                                            "Enter public HTTPS base URL (empty to clear):",
+                                            "輸入公開 HTTPS Base URL（留空清除）：",
+                                        ),
+                                        &current_url,
+                                    )
+                                    .await?
+                                    {
+                                        let trimmed = new_url.trim();
+                                        let normalized = if trimmed.is_empty() {
+                                            Ok(None)
+                                        } else {
+                                            normalize_public_base_url_input(trimmed).map(Some)
+                                        };
+                                        match normalized {
+                                            Ok(value) => {
+                                                save_public_base_url(value.as_deref())?;
+                                                let mut app = state.lock().await;
+                                                app.public_base_url = value;
+                                                app.log("INFO", "Updated public base URL".into());
+                                                app.persist_state_with_log();
+                                            }
+                                            Err(error) => {
+                                                state.lock().await.log("WARN", error);
+                                            }
                                         }
                                     }
                                 }
@@ -2515,6 +3203,8 @@ fn draw_settings(
     current_theme: &theme::ThemeDef,
     current_tool_mode: ToolMode,
     current_show_detail_mode: ShowDetailMode,
+    current_widget_corner_style: WidgetCornerStyle,
+    ui_language: UiLanguage,
     set_catdesk_as_co_author: bool,
     mcp_slug: &str,
     public_base_url: Option<&str>,
@@ -2525,6 +3215,7 @@ fn draw_settings(
     let themes = theme::all();
     let tool_modes = ToolMode::all();
     let show_detail_modes = ShowDetailMode::all();
+    let widget_corner_styles = WidgetCornerStyle::all();
     let palette = current_theme.palette;
     let area = f.area();
     let chunks = Layout::default()
@@ -2536,13 +3227,13 @@ fn draw_settings(
         ])
         .split(area);
 
-    draw_tui_header(f, chunks[0], &palette, "Settings");
+    draw_tui_header(f, chunks[0], &palette, ui_language.text("Settings", "設定"));
 
     let mut selected_line_idx = 0;
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Choose a theme",
+            ui_language.text("  Choose a theme", "  選擇主題"),
             Style::default()
                 .fg(palette.title_fg)
                 .add_modifier(Modifier::BOLD),
@@ -2563,12 +3254,17 @@ fn draw_settings(
             selected_line_idx = lines.len();
         }
         let mut spans = vec![Span::styled(
-            format!(" {} [{}] {}", marker, idx + 1, theme.label),
+            format!(
+                " {} [{}] {}",
+                marker,
+                idx + 1,
+                theme.label_for(ui_language.is_traditional_chinese())
+            ),
             name_style,
         )];
         if theme.id == current_theme.id {
             spans.push(Span::styled(
-                "  [current]",
+                ui_language.text("  [current]", "  [目前]"),
                 Style::default()
                     .fg(palette.secondary_fg)
                     .add_modifier(Modifier::BOLD),
@@ -2576,13 +3272,16 @@ fn draw_settings(
         }
         lines.push(Line::from(spans));
         lines.push(Line::from(vec![Span::styled(
-            format!("     {}", theme.description),
+            format!(
+                "     {}",
+                theme.description_for(ui_language.is_traditional_chinese())
+            ),
             Style::default().fg(palette.muted_fg),
         )]));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Choose a tool mode",
+        ui_language.text("  Choose a tool mode", "  選擇工具模式"),
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2603,12 +3302,17 @@ fn draw_settings(
             selected_line_idx = lines.len();
         }
         let mut spans = vec![Span::styled(
-            format!(" {} [{}] {}", marker, row_idx + 1, tool_mode.label()),
+            format!(
+                " {} [{}] {}",
+                marker,
+                row_idx + 1,
+                tool_mode.label_for(ui_language)
+            ),
             name_style,
         )];
         if *tool_mode == current_tool_mode {
             spans.push(Span::styled(
-                "  [current]",
+                ui_language.text("  [current]", "  [目前]"),
                 Style::default()
                     .fg(palette.secondary_fg)
                     .add_modifier(Modifier::BOLD),
@@ -2616,14 +3320,14 @@ fn draw_settings(
         }
         lines.push(Line::from(spans));
         lines.push(Line::from(vec![Span::styled(
-            format!("     {}", tool_mode.description()),
+            format!("     {}", tool_mode.description_for(ui_language)),
             Style::default().fg(palette.muted_fg),
         )]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Choose a widget detail mode",
+        ui_language.text("  Choose a widget detail mode", "  選擇 Widget 詳細模式"),
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2644,12 +3348,17 @@ fn draw_settings(
             selected_line_idx = lines.len();
         }
         let mut spans = vec![Span::styled(
-            format!(" {} [{}] {}", marker, row_idx + 1, detail_mode.label()),
+            format!(
+                " {} [{}] {}",
+                marker,
+                row_idx + 1,
+                detail_mode.label_for(ui_language)
+            ),
             name_style,
         )];
         if *detail_mode == current_show_detail_mode {
             spans.push(Span::styled(
-                "  [current]",
+                ui_language.text("  [current]", "  [目前]"),
                 Style::default()
                     .fg(palette.secondary_fg)
                     .add_modifier(Modifier::BOLD),
@@ -2657,12 +3366,59 @@ fn draw_settings(
         }
         lines.push(Line::from(spans));
         lines.push(Line::from(vec![Span::styled(
-            format!("     {}", detail_mode.description()),
+            format!("     {}", detail_mode.description_for(ui_language)),
             Style::default().fg(palette.muted_fg),
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len() + show_detail_modes.len();
+    let widget_corner_start = themes.len() + tool_modes.len() + show_detail_modes.len();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text("  Choose a widget corner style", "  選擇 Widget 邊角樣式"),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    for (idx, corner_style) in widget_corner_styles.iter().enumerate() {
+        let row_idx = widget_corner_start + idx;
+        let selected = row_idx == selected_row;
+        let marker = if selected { ">" } else { " " };
+        let name_style = if selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        };
+        lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
+        let mut spans = vec![Span::styled(
+            format!(
+                " {} [{}] {}",
+                marker,
+                row_idx + 1,
+                corner_style.label_for(ui_language)
+            ),
+            name_style,
+        )];
+        if *corner_style == current_widget_corner_style {
+            spans.push(Span::styled(
+                ui_language.text("  [current]", "  [目前]"),
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(vec![Span::styled(
+            format!("     {}", corner_style.description_for(ui_language)),
+            Style::default().fg(palette.muted_fg),
+        )]));
+    }
+
+    let co_author_row = widget_corner_start + widget_corner_styles.len();
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -2674,7 +3430,7 @@ fn draw_settings(
     };
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Commit attribution",
+        ui_language.text("  Commit attribution", "  Commit 署名"),
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2684,9 +3440,10 @@ fn draw_settings(
     }
     lines.push(Line::from(vec![Span::styled(
         format!(
-            " {} [{}] Set CatDesk as co-author",
+            " {} [{}] {}",
             co_author_marker,
-            co_author_row + 1
+            co_author_row + 1,
+            ui_language.text("Set CatDesk as co-author", "將 CatDesk 設為共同作者")
         ),
         co_author_name_style,
     )]));
@@ -2694,9 +3451,9 @@ fn draw_settings(
         Span::styled("     ", Style::default()),
         Span::styled(
             if set_catdesk_as_co_author {
-                "[enabled]"
+                ui_language.text("[enabled]", "[已啟用]")
             } else {
-                "[disabled]"
+                ui_language.text("[disabled]", "[已停用]")
             },
             Style::default().fg(if set_catdesk_as_co_author {
                 palette.success_fg
@@ -2707,7 +3464,10 @@ fn draw_settings(
     ]));
 
     lines.push(Line::from(vec![Span::styled(
-        "     When enabled, CatDesk automatically appends \"Co-Authored-By: CatDesk\" to git commits and blocks manually written CatDesk co-author trailers.",
+        ui_language.text(
+            "     When enabled, CatDesk automatically appends \"Co-Authored-By: CatDesk\" to git commits and blocks manually written CatDesk co-author trailers.",
+            "     啟用後，CatDesk 會自動在 Git commit 加上 \"Co-Authored-By: CatDesk\"，並阻止手動加入重複的 CatDesk co-author trailer。",
+        ),
         Style::default().fg(palette.muted_fg),
     )]));
 
@@ -2746,7 +3506,7 @@ fn draw_settings(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Connection Security URL",
+        ui_language.text("  Connection Security URL", "  連線安全 URL"),
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2756,9 +3516,10 @@ fn draw_settings(
     }
     lines.push(Line::from(vec![Span::styled(
         format!(
-            " {} [{}] Keep current recorded slug",
+            " {} [{}] {}",
             slug_keep_marker,
-            slug_keep_row + 1
+            slug_keep_row + 1,
+            ui_language.text("Keep current recorded slug", "保留目前記錄的 slug")
         ),
         slug_keep_name_style,
     )]));
@@ -2774,9 +3535,10 @@ fn draw_settings(
     }
     lines.push(Line::from(vec![Span::styled(
         format!(
-            " {} [{}] Generate new random slug",
+            " {} [{}] {}",
             slug_new_marker,
-            slug_new_row + 1
+            slug_new_row + 1,
+            ui_language.text("Generate new random slug", "產生新的隨機 slug")
         ),
         slug_new_name_style,
     )]));
@@ -2785,55 +3547,71 @@ fn draw_settings(
     }
     lines.push(Line::from(vec![Span::styled(
         format!(
-            " {} [{}] Set public base URL",
+            " {} [{}] {}",
             public_url_marker,
-            public_url_row + 1
+            public_url_row + 1,
+            ui_language.text("Set public base URL", "設定公開 Base URL")
         ),
         public_url_name_style,
     )]));
     lines.push(Line::from(vec![
         Span::styled("     ", Style::default()),
         Span::styled(
-            if let Some(url) = public_base_url {
-                format!("[{}]", url)
+            if let Some(domain) = public_base_url {
+                format!("[{}]", domain)
             } else {
-                "[not set]".to_string()
+                ui_language.text("[not set]", "[未設定]").to_string()
             },
             Style::default().fg(palette.muted_fg),
         ),
     ]));
     lines.push(Line::from(vec![Span::styled(
-        "     Configure cloudflared separately to forward this hostname to http://127.0.0.1:3200.",
+        ui_language.text(
+            "     Configure cloudflared separately to forward this hostname to http://127.0.0.1:3200.",
+            "     請另外設定 cloudflared，將此主機名稱轉送到 http://127.0.0.1:3200。",
+        ),
         Style::default().fg(palette.muted_fg),
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Token billing",
+        ui_language.text("  Token billing", "  Token 計費"),
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(vec![
-        Span::styled("  Input ", Style::default().fg(palette.muted_fg)),
+        Span::styled(
+            ui_language.text("  Input ", "  輸入 "),
+            Style::default().fg(palette.muted_fg),
+        ),
         Span::styled(
             usage_totals.tool_input_tokens.to_string(),
             Style::default().fg(palette.primary_fg),
         ),
-        Span::styled("   Output ", Style::default().fg(palette.muted_fg)),
+        Span::styled(
+            ui_language.text("   Output ", "   輸出 "),
+            Style::default().fg(palette.muted_fg),
+        ),
         Span::styled(
             usage_totals.tool_output_tokens.to_string(),
             Style::default().fg(palette.primary_fg),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  Total ", Style::default().fg(palette.muted_fg)),
+        Span::styled(
+            ui_language.text("  Total ", "  總計 "),
+            Style::default().fg(palette.muted_fg),
+        ),
         Span::styled(
             usage_totals.total_tokens.to_string(),
             Style::default()
                 .fg(palette.secondary_fg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("   Tool calls ", Style::default().fg(palette.muted_fg)),
+        Span::styled(
+            ui_language.text("   Tool calls ", "   工具呼叫 "),
+            Style::default().fg(palette.muted_fg),
+        ),
         Span::styled(
             usage_totals.tool_call_count.to_string(),
             Style::default().fg(palette.primary_fg),
@@ -2843,9 +3621,12 @@ fn draw_settings(
         Span::styled("  [r]", Style::default().fg(palette.warning_fg)),
         Span::styled(
             if confirm_reset_token_billing {
-                " Press again to confirm token billing reset"
+                ui_language.text(
+                    " Press again to confirm token billing reset",
+                    " 再按一次確認重設 Token 計費",
+                )
             } else {
-                " Reset token billing totals"
+                ui_language.text(" Reset token billing totals", " 重設 Token 計費總計")
             },
             Style::default().fg(if confirm_reset_token_billing {
                 palette.danger_fg
@@ -2862,7 +3643,7 @@ fn draw_settings(
 
     let body = Paragraph::new(lines).scroll((scroll_y, 0)).block(
         Block::default()
-            .title(" Theme, Tool Mode & Billing ")
+            .title(ui_language.text(" Theme, Tool Mode & Billing ", " 主題、工具模式與計費 "))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -2871,9 +3652,9 @@ fn draw_settings(
 
     let keys = Paragraph::new(Line::from(vec![
         Span::styled("  [Up/Down]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Select  "),
+        Span::raw(ui_language.text(" Select  ", " 選擇  ")),
         Span::styled("[Enter]", Style::default().fg(palette.success_fg)),
-        Span::raw(" Apply  "),
+        Span::raw(ui_language.text(" Apply  ", " 套用  ")),
         Span::styled(
             "[r]",
             Style::default().fg(if confirm_reset_token_billing {
@@ -2883,16 +3664,16 @@ fn draw_settings(
             }),
         ),
         Span::raw(if confirm_reset_token_billing {
-            " Confirm reset  "
+            ui_language.text(" Confirm reset  ", " 確認重設  ")
         } else {
-            " Reset token billing  "
+            ui_language.text(" Reset token billing  ", " 重設 Token 計費  ")
         }),
         Span::styled("[q/Esc]", Style::default().fg(palette.danger_fg)),
-        Span::raw(" Back"),
+        Span::raw(ui_language.text(" Back", " 返回")),
     ]))
     .block(
         Block::default()
-            .title(" Keys ")
+            .title(ui_language.text(" Keys ", " 按鍵 "))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -2972,9 +3753,9 @@ async fn run_browser_select(
             selected_supported_idx = 0;
         }
 
-        let current_theme = {
+        let (current_theme, current_ui_language) = {
             let app = state.lock().await;
-            app.current_theme()
+            (app.current_theme(), app.ui_language)
         };
         terminal.draw(|f| {
             draw_browser_select(
@@ -2983,6 +3764,7 @@ async fn run_browser_select(
                 &supported_indices,
                 selected_supported_idx,
                 current_theme,
+                current_ui_language,
             )
         })?;
 
@@ -3075,6 +3857,7 @@ fn draw_browser_select(
     supported_indices: &[usize],
     selected_supported_idx: usize,
     theme: &theme::ThemeDef,
+    ui_language: UiLanguage,
 ) {
     let palette = theme.palette;
     let area = f.area();
@@ -3091,14 +3874,17 @@ fn draw_browser_select(
         f,
         chunks[0],
         &palette,
-        "Select Browser - Installed and Remote Debugging Status",
+        ui_language.text(
+            "Select Browser - Installed and Remote Debugging Status",
+            "選擇瀏覽器 - 已安裝與遠端除錯狀態",
+        ),
     );
 
     let active_summary = browser::format_active_remote_debug_names(browsers);
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(
-                "  Installed browsers ",
+                ui_language.text("  Installed browsers ", "  已安裝瀏覽器 "),
                 Style::default().fg(palette.muted_fg),
             ),
             Span::styled(
@@ -3110,14 +3896,14 @@ fn draw_browser_select(
         ]),
         Line::from(vec![
             Span::styled(
-                "  Remote debugging active ",
+                ui_language.text("  Remote debugging active ", "  遠端除錯啟用 "),
                 Style::default().fg(palette.muted_fg),
             ),
             Span::styled(active_summary, Style::default().fg(palette.success_fg)),
         ]),
         Line::from(vec![
             Span::styled(
-                "  Selectable (Chromium) ",
+                ui_language.text("  Selectable (Chromium) ", "  可選擇（Chromium） "),
                 Style::default().fg(palette.muted_fg),
             ),
             Span::styled(
@@ -3132,12 +3918,18 @@ fn draw_browser_select(
 
     if browsers.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No browser found in PATH. Press [r] to rescan, [q] to quit.",
+            ui_language.text(
+                "  No browser found in PATH. Press [r] to rescan, [q] to quit.",
+                "  在 PATH 中找不到瀏覽器。按 [r] 重新掃描，[q] 離開。",
+            ),
             Style::default().fg(palette.danger_fg),
         )));
     } else if supported_indices.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  Only unsupported browsers found (e.g. Firefox). Chromium browsers are required.",
+            ui_language.text(
+                "  Only unsupported browsers found (e.g. Firefox). Chromium browsers are required.",
+                "  只找到尚未支援的瀏覽器（例如 Firefox）。需要 Chromium 瀏覽器。",
+            ),
             Style::default().fg(palette.danger_fg),
         )));
         lines.push(Line::from(""));
@@ -3147,7 +3939,19 @@ fn draw_browser_select(
                 Style::default().fg(palette.muted_fg),
             )]));
             lines.push(Line::from(vec![Span::styled(
-                format!("     status {}", browser.support_note),
+                format!(
+                    "     {} {}",
+                    ui_language.text("status", "狀態"),
+                    if ui_language.is_traditional_chinese() {
+                        if browser.mcp_supported {
+                            "Chromium（支援）"
+                        } else {
+                            "尚未支援（Firefox 的 CDP bridge 尚未接上）"
+                        }
+                    } else {
+                        browser.support_note.as_str()
+                    }
+                ),
                 Style::default().fg(palette.warning_fg),
             )]));
             lines.push(Line::from(""));
@@ -3188,11 +3992,23 @@ fn draw_browser_select(
                 )]));
             }
             lines.push(Line::from(vec![Span::styled(
-                format!("     path {}", browser.path),
+                format!("     {} {}", ui_language.text("path", "路徑"), browser.path),
                 Style::default().fg(palette.muted_fg),
             )]));
             lines.push(Line::from(vec![Span::styled(
-                format!("     status {}", browser.support_note),
+                format!(
+                    "     {} {}",
+                    ui_language.text("status", "狀態"),
+                    if ui_language.is_traditional_chinese() {
+                        if browser.mcp_supported {
+                            "Chromium（支援）"
+                        } else {
+                            "尚未支援（Firefox 的 CDP bridge 尚未接上）"
+                        }
+                    } else {
+                        browser.support_note.as_str()
+                    }
+                ),
                 Style::default().fg(if browser.mcp_supported {
                     palette.success_fg
                 } else {
@@ -3201,7 +4017,10 @@ fn draw_browser_select(
             )]));
             if !browser.mcp_supported {
                 lines.push(Line::from(vec![Span::styled(
-                    "     remote debugging integration not supported yet",
+                    ui_language.text(
+                        "     remote debugging integration not supported yet",
+                        "     尚未支援遠端除錯整合",
+                    ),
                     Style::default().fg(palette.warning_fg),
                 )]));
             } else if browser.remote_debug_active {
@@ -3211,15 +4030,26 @@ fn draw_browser_select(
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "--".into());
                 lines.push(Line::from(vec![Span::styled(
-                    format!("     remote debugging ACTIVE at {target} (pid {pid})"),
+                    if ui_language.is_traditional_chinese() {
+                        format!("     遠端除錯已啟用：{target}（PID {pid}）")
+                    } else {
+                        format!("     remote debugging ACTIVE at {target} (pid {pid})")
+                    },
                     Style::default().fg(palette.success_fg),
                 )]));
             } else {
                 lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        "     remote debugging not active (supported flag {})",
-                        browser.remote_debug_hint
-                    ),
+                    if ui_language.is_traditional_chinese() {
+                        format!(
+                            "     遠端除錯未啟用（支援參數 {}）",
+                            browser.remote_debug_hint
+                        )
+                    } else {
+                        format!(
+                            "     remote debugging not active (supported flag {})",
+                            browser.remote_debug_hint
+                        )
+                    },
                     Style::default().fg(palette.warning_fg),
                 )]));
             }
@@ -3229,7 +4059,7 @@ fn draw_browser_select(
 
     let body = Paragraph::new(lines).block(
         Block::default()
-            .title(" Browser List ")
+            .title(ui_language.text(" Browser List ", " 瀏覽器清單 "))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -3238,19 +4068,22 @@ fn draw_browser_select(
 
     let keys = Paragraph::new(Line::from(vec![
         Span::styled("  [Up/Down]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Select  "),
+        Span::raw(ui_language.text(" Select  ", " 選擇  ")),
         Span::styled("[1-9]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Quick select (Chromium only)  "),
+        Span::raw(ui_language.text(
+            " Quick select (Chromium only)  ",
+            " 快速選擇（僅 Chromium）  ",
+        )),
         Span::styled("[Enter]", Style::default().fg(palette.success_fg)),
-        Span::raw(" Confirm  "),
+        Span::raw(ui_language.text(" Confirm  ", " 確認  ")),
         Span::styled("[r]", Style::default().fg(palette.warning_fg)),
-        Span::raw(" Rescan  "),
+        Span::raw(ui_language.text(" Rescan  ", " 重新掃描  ")),
         Span::styled("[q]", Style::default().fg(palette.danger_fg)),
-        Span::raw(" Quit"),
+        Span::raw(ui_language.text(" Quit", " 離開")),
     ]))
     .block(
         Block::default()
-            .title(" Keys ")
+            .title(ui_language.text(" Keys ", " 按鍵 "))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -3730,6 +4563,7 @@ async fn run_tui(
         }
 
         if event::poll(UI_POLL_INTERVAL)? {
+            let current_ui_language = { state.lock().await.ui_language };
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -3750,11 +4584,20 @@ async fn run_tui(
                                         "INFO",
                                         format!("Exported logs to {}", path.to_string_lossy()),
                                     );
-                                    toast = Some(("Logs exported", (2, 2), Instant::now()));
+                                    toast = Some((
+                                        current_ui_language.text("Logs exported", "紀錄已匯出"),
+                                        (2, 2),
+                                        Instant::now(),
+                                    ));
                                 }
                                 Err(error) => {
                                     app.log("ERROR", format!("Failed to export logs: {error}"));
-                                    toast = Some(("Log export failed", (2, 2), Instant::now()));
+                                    toast = Some((
+                                        current_ui_language
+                                            .text("Log export failed", "紀錄匯出失敗"),
+                                        (2, 2),
+                                        Instant::now(),
+                                    ));
                                 }
                             }
                         }
@@ -3801,9 +4644,9 @@ async fn run_tui(
                                     let text = extract_from_screen(&screen_lines, start, end);
                                     if !text.is_empty() {
                                         let message = if clipboard_copy(&text) {
-                                            "Copied!"
+                                            current_ui_language.text("Copied!", "已複製！")
                                         } else {
-                                            "Copy failed"
+                                            current_ui_language.text("Copy failed", "複製失敗")
                                         };
                                         toast = Some((
                                             message,
@@ -3845,9 +4688,15 @@ async fn run_tui(
                                                     .insert(*log_id, now + MCP_URL_REVEAL_DURATION);
                                                 let reveal_message =
                                                     if post_mcp_path(message).is_some() {
-                                                        "MCP path revealed for 10s"
+                                                        current_ui_language.text(
+                                                            "MCP path revealed for 10s",
+                                                            "MCP 路徑顯示 10 秒",
+                                                        )
                                                     } else {
-                                                        "URL revealed for 10s"
+                                                        current_ui_language.text(
+                                                            "URL revealed for 10s",
+                                                            "URL 顯示 10 秒",
+                                                        )
                                                     };
                                                 toast = Some((
                                                     reveal_message,
@@ -3860,7 +4709,8 @@ async fn run_tui(
                                             Some(CHATGPT_CONNECTOR_SETTINGS_URL.to_string())
                                         } else if let Some(ref url) = last_mcp_url {
                                             let prefix = &url[..url.len().min(30)];
-                                            if line.contains("MCP Server URL")
+                                            if (line.contains("MCP Server URL")
+                                                || line.contains("MCP 伺服器 URL"))
                                                 || line.contains(prefix)
                                             {
                                                 let revealed = mcp_url_revealed_until
@@ -3876,7 +4726,10 @@ async fn run_tui(
                                                     mcp_url_revealed_until =
                                                         Some(now + MCP_URL_REVEAL_DURATION);
                                                     toast = Some((
-                                                        "URL revealed for 10s",
+                                                        current_ui_language.text(
+                                                            "URL revealed for 10s",
+                                                            "URL 顯示 10 秒",
+                                                        ),
                                                         (mouse.column, mouse.row),
                                                         now,
                                                     ));
@@ -3890,9 +4743,12 @@ async fn run_tui(
                                         }
                                         .or_else(|| {
                                             if line.contains("\u{2502}") {
-                                                if line.contains("Name") {
+                                                if line.contains("Name") || line.contains("名稱")
+                                                {
                                                     Some("CatDesk".to_string())
-                                                } else if line.contains("Authentication") {
+                                                } else if line.contains("Authentication")
+                                                    || line.contains("驗證方式")
+                                                {
                                                     Some("None".to_string())
                                                 } else {
                                                     None
@@ -3903,9 +4759,9 @@ async fn run_tui(
                                         });
                                         if let Some(text) = copy_value {
                                             let message = if clipboard_copy(&text) {
-                                                "Copied!"
+                                                current_ui_language.text("Copied!", "已複製！")
                                             } else {
-                                                "Copy failed"
+                                                current_ui_language.text("Copy failed", "複製失敗")
                                             };
                                             toast = Some((
                                                 message,
@@ -3957,6 +4813,7 @@ fn draw_ui(
     log_secret_revealed_until: &HashMap<u64, Instant>,
 ) {
     let palette = app.current_theme().palette;
+    let ui_language = app.ui_language;
     let area = f.area();
     let now_millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -3992,25 +4849,30 @@ fn draw_ui(
         f,
         chunks[0],
         &palette,
-        "CatDesk - Turns ChatGPT Web into a coding agent =w=",
+        ui_language.text(
+            "CatDesk - Turns ChatGPT Web into a coding agent =w=",
+            "CatDesk - 讓 ChatGPT Web 變成程式代理 =w=",
+        ),
     );
 
     // ── Status ──
-    let mode_label = app.mode.label();
-    let tool_mode_label = app.tool_mode.label();
+    let mode_label = app.mode.label_for(ui_language);
+    let tool_mode_label = app.tool_mode.label_for(ui_language);
     let server_status = if app.server_running {
-        format!("RUNNING (port {})", app.port)
+        if ui_language.is_traditional_chinese() {
+            format!("執行中（連接埠 {}）", app.port)
+        } else {
+            format!("RUNNING (port {})", app.port)
+        }
     } else {
-        "STOPPED".into()
+        ui_language.text("STOPPED", "已停止").into()
     };
     let devtools_status: &str = if app.devtools_running {
-        "RUNNING"
+        ui_language.text("RUNNING", "執行中")
+    } else if app.mode.browser_enabled() {
+        ui_language.text("STOPPED", "已停止")
     } else {
-        if app.mode.browser_enabled() {
-            "STOPPED"
-        } else {
-            "N/A"
-        }
+        ui_language.text("N/A", "不適用")
     };
     let full_mcp_url = app.public_mcp_url();
     let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
@@ -4019,8 +4881,14 @@ fn draw_ui(
         (Some(_), false) => MCP_URL_MASK.to_string(),
         (None, _) => "--".to_string(),
     };
-    let mcp_url_security_status = mcp_url_reveal_remaining
-        .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
+    let mcp_url_security_status = mcp_url_reveal_remaining.map(|remaining| {
+        let seconds = mcp_url_reveal_seconds(remaining);
+        if ui_language.is_traditional_chinese() {
+            format!("[ 已顯示 {:>2}秒 ]", seconds)
+        } else {
+            format!("[ EXPOSED {:>2}s ]", seconds)
+        }
+    });
     let browser_summary = browser::format_browser_names(&app.detected_browsers);
     let remote_support_summary = browser::format_remote_debug_names(&app.detected_browsers);
     let remote_active_summary = browser::format_active_remote_debug_names(&app.detected_browsers);
@@ -4033,9 +4901,11 @@ fn draw_ui(
         .selected_browser
         .as_ref()
         .map(|b| {
-            b.remote_debug_target
-                .clone()
-                .unwrap_or_else(|| "launch new browser instance".into())
+            b.remote_debug_target.clone().unwrap_or_else(|| {
+                ui_language
+                    .text("launch new browser instance", "啟動新的瀏覽器執行個體")
+                    .into()
+            })
         })
         .unwrap_or_else(|| "--".into());
     let computer_role_style = Style::default()
@@ -4060,7 +4930,10 @@ fn draw_ui(
     };
     let request_stats_for = |app: &AppState| -> Vec<Span<'static>> {
         vec![
-            Span::styled("  Requests ", Style::default().fg(palette.muted_fg)),
+            Span::styled(
+                ui_language.text("  Requests ", "  請求 "),
+                Style::default().fg(palette.muted_fg),
+            ),
             Span::styled(
                 app.request_count.to_string(),
                 Style::default().fg(palette.title_fg),
@@ -4072,7 +4945,7 @@ fn draw_ui(
         .add_modifier(Modifier::BOLD);
     let status_label = |label: &'static str| -> Span<'static> {
         Span::styled(
-            format!("  {label:<width$} ", width = STATUS_LABEL_WIDTH),
+            format!("  {} ", pad_right_to_cell_width(label, STATUS_LABEL_WIDTH)),
             status_label_style,
         )
     };
@@ -4091,7 +4964,7 @@ fn draw_ui(
     );
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
-            status_label("Mode"),
+            status_label(ui_language.text("Mode", "模式")),
             Span::styled(
                 mode_label,
                 Style::default()
@@ -4100,7 +4973,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("Tool mode"),
+            status_label(ui_language.text("Tool mode", "工具模式")),
             Span::styled(
                 tool_mode_label,
                 Style::default()
@@ -4109,7 +4982,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("Server"),
+            status_label(ui_language.text("Server", "伺服器")),
             Span::styled(
                 &server_status,
                 Style::default().fg(if app.server_running {
@@ -4132,7 +5005,7 @@ fn draw_ui(
         ]),
         {
             let mut spans = vec![
-                status_label("MCP Server URL"),
+                status_label(ui_language.text("MCP Server URL", "MCP 伺服器 URL")),
                 Span::styled(
                     &mcp_url,
                     Style::default().fg(if has_url {
@@ -4150,7 +5023,7 @@ fn draw_ui(
                 spans.push(Span::raw("  "));
                 let security_text = mcp_url_security_status
                     .as_deref()
-                    .unwrap_or("Click to reveal");
+                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
                 let security_color = match mcp_url_reveal_remaining {
                     Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
                     Some(_) => palette.warning_fg,
@@ -4180,14 +5053,16 @@ fn draw_ui(
             Line::from(spans)
         },
         Line::from(vec![
-            status_label("Workspace"),
+            status_label(ui_language.text("Workspace", "工作區")),
             Span::styled(
                 &*app.workspace_root,
                 Style::default().fg(palette.secondary_fg),
             ),
         ]),
         {
-            let mut spans = vec![status_label("Remote connected")];
+            let mut spans = vec![status_label(
+                ui_language.text("Remote connected", "遠端已連線"),
+            )];
             if app.remote_connected {
                 spans.push(Span::styled(
                     "V",
@@ -4208,44 +5083,46 @@ fn draw_ui(
         usage_line(
             &app.session_usage_totals,
             session_usage_cost_usd,
-            status_label("Session"),
+            status_label(ui_language.text("Session", "本次工作階段")),
             &palette,
             &usage_widths,
+            ui_language,
         ),
         usage_line(
             &all_time_usage_totals,
             all_time_usage_cost_usd,
-            status_label("All-time"),
+            status_label(ui_language.text("All-time", "累計")),
             &palette,
             &usage_widths,
+            ui_language,
         ),
     ];
 
     if !show_guide {
         status_lines.push(Line::from(vec![
-            status_label("Local browsers"),
+            status_label(ui_language.text("Local browsers", "本機瀏覽器")),
             Span::styled(browser_summary, Style::default().fg(palette.title_fg)),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Remote dbg support"),
+            status_label(ui_language.text("Remote dbg support", "遠端除錯支援")),
             Span::styled(remote_support_summary, Style::default().fg(palette.info_fg)),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Remote dbg active"),
+            status_label(ui_language.text("Remote dbg active", "遠端除錯啟用")),
             Span::styled(
                 remote_active_summary,
                 Style::default().fg(palette.success_fg),
             ),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Selected browser"),
+            status_label(ui_language.text("Selected browser", "選取的瀏覽器")),
             Span::styled(
                 selected_browser_summary,
                 Style::default().fg(palette.secondary_fg),
             ),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Selected target"),
+            status_label(ui_language.text("Selected target", "選取的目標")),
             Span::styled(
                 selected_target_summary,
                 Style::default().fg(palette.info_fg),
@@ -4263,11 +5140,11 @@ fn draw_ui(
         status_lines.push(Line::from(""));
         if visible_flow_count == 0 {
             let call_text = if app.remote_connected {
-                "awaiting request"
+                ui_language.text("awaiting request", "等待請求")
             } else {
-                "awaiting connection"
+                ui_language.text("awaiting connection", "等待連線")
             };
-            let call_offset = flow_call_offset(call_text);
+            let call_offset = flow_call_offset(call_text, flow_lane_left_label(ui_language));
             status_lines.push(Line::from(vec![
                 Span::styled("    ", Style::default().fg(palette.muted_fg)),
                 Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
@@ -4276,7 +5153,7 @@ fn draw_ui(
             let lane = lane_for(false, None);
             let mut row = vec![
                 Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                Span::styled(FLOW_LANE_LEFT_LABEL, computer_role_style),
+                Span::styled(flow_lane_left_label(ui_language), computer_role_style),
             ];
             row.extend(lane);
             row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
@@ -4292,7 +5169,7 @@ fn draw_ui(
             {
                 let latest_action = latest_flow_action(flow);
                 let call_text = trim_line(&latest_action, FLOW_ROW_CELLS);
-                let call_offset = flow_call_offset(&call_text);
+                let call_offset = flow_call_offset(&call_text, flow_lane_left_label(ui_language));
                 status_lines.push(Line::from(vec![
                     Span::styled("    ", Style::default().fg(palette.muted_fg)),
                     Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
@@ -4305,14 +5182,14 @@ fn draw_ui(
                 let lane = lane_for(lane_active, Some(flow));
                 let mut row = vec![
                     Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(FLOW_LANE_LEFT_LABEL, computer_role_style),
+                    Span::styled(flow_lane_left_label(ui_language), computer_role_style),
                 ];
                 row.extend(lane);
                 row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
                 row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
                 row.extend(request_stats_for(app));
                 status_lines.push(Line::from(row));
-                status_lines.push(flow_turn_usage_line(flow, &palette));
+                status_lines.push(flow_turn_usage_line(flow, &palette, ui_language));
             }
         }
     }
@@ -4338,21 +5215,42 @@ fn draw_ui(
             vec![
                 Line::from(vec![
                     Span::styled("  ✅ ", guide_step_style),
-                    Span::styled("Connection URL is fixed and ready!", guide_strong_style),
+                    Span::styled(
+                        ui_language.text(
+                            "Connection URL is fixed and ready!",
+                            "連線 URL 已固定並準備完成！",
+                        ),
+                        guide_strong_style,
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("     You do ", guide_text_style),
-                    Span::styled("NOT", guide_strong_style),
-                    Span::styled(" need to recreate the app in ChatGPT.", guide_text_style),
+                    Span::styled(
+                        ui_language.text("     You do ", "     你"),
+                        guide_text_style,
+                    ),
+                    Span::styled(ui_language.text("NOT", "不需要"), guide_strong_style),
+                    Span::styled(
+                        ui_language.text(
+                            " need to recreate the app in ChatGPT.",
+                            "在 ChatGPT 裡重新建立 App。",
+                        ),
+                        guide_text_style,
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
-                    "     Simply go to your ChatGPT conversation and send a message.",
+                    ui_language.text(
+                        "     Simply go to your ChatGPT conversation and send a message.",
+                        "     直接回到 ChatGPT 對話並傳送一則訊息即可。",
+                    ),
                     guide_text_style,
                 )]),
                 Line::from(vec![Span::styled(
-                    "     CatDesk will instantly connect and this screen will disappear.",
+                    ui_language.text(
+                        "     CatDesk will instantly connect and this screen will disappear.",
+                        "     CatDesk 會立即連線，這個畫面也會自動消失。",
+                    ),
                     guide_detail_style,
                 )]),
             ]
@@ -4360,8 +5258,14 @@ fn draw_ui(
             vec![
                 Line::from(vec![
                     Span::styled("  1. ", guide_step_style),
-                    Span::styled("Open connector settings: ", guide_text_style),
-                    Span::styled("(click to copy)", guide_detail_style),
+                    Span::styled(
+                        ui_language.text("Open connector settings: ", "開啟 Connector 設定："),
+                        guide_text_style,
+                    ),
+                    Span::styled(
+                        ui_language.text("(click to copy)", "（點擊複製）"),
+                        guide_detail_style,
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("     ", guide_text_style),
@@ -4370,23 +5274,35 @@ fn draw_ui(
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  2. ", guide_step_style),
-                    Span::styled("Click ", guide_text_style),
+                    Span::styled(ui_language.text("Click ", "點擊 "), guide_text_style),
                     Span::styled("Create app", guide_strong_style),
                 ]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  3. ", guide_step_style),
-                    Span::styled("Fill in the form: ", guide_text_style),
-                    Span::styled("(URL reveals before copy)", guide_detail_style),
+                    Span::styled(
+                        ui_language.text("Fill in the form: ", "填寫表單："),
+                        guide_text_style,
+                    ),
+                    Span::styled(
+                        ui_language.text("(URL reveals before copy)", "（複製前會顯示 URL）"),
+                        guide_detail_style,
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("     Name          ", guide_detail_style),
+                    Span::styled(
+                        ui_language.text("     Name          ", "     名稱          "),
+                        guide_detail_style,
+                    ),
                     Span::styled(" │ ", guide_separator_style),
                     Span::styled("CatDesk", guide_copyable_style),
                 ]),
                 {
                     let mut spans = vec![
-                        Span::styled("     MCP Server URL", guide_detail_style),
+                        Span::styled(
+                            ui_language.text("     MCP Server URL", "     MCP 伺服器 URL"),
+                            guide_detail_style,
+                        ),
                         Span::styled(" │ ", guide_separator_style),
                         Span::styled(
                             mcp_url.clone(),
@@ -4401,7 +5317,7 @@ fn draw_ui(
                         spans.push(Span::raw("  "));
                         let security_text = mcp_url_security_status
                             .as_deref()
-                            .unwrap_or("Click to reveal");
+                            .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
                         let security_color = match mcp_url_reveal_remaining {
                             Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
                                 palette.danger_fg
@@ -4434,20 +5350,23 @@ fn draw_ui(
                     Line::from(spans)
                 },
                 Line::from(vec![
-                    Span::styled("     Authentication", guide_detail_style),
+                    Span::styled(
+                        ui_language.text("     Authentication", "     驗證方式"),
+                        guide_detail_style,
+                    ),
                     Span::styled(" │ ", guide_separator_style),
                     Span::styled("None", guide_copyable_style),
                 ]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  4. ", guide_step_style),
-                    Span::styled("Click ", guide_text_style),
+                    Span::styled(ui_language.text("Click ", "點擊 "), guide_text_style),
                     Span::styled("I understand and want to continue", guide_strong_style),
                 ]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  5. ", guide_step_style),
-                    Span::styled("Click ", guide_text_style),
+                    Span::styled(ui_language.text("Click ", "點擊 "), guide_text_style),
                     Span::styled("Create", guide_strong_style),
                 ]),
             ]
@@ -4475,11 +5394,11 @@ fn draw_ui(
             .split(chunks[1])
     };
     let status_title = if show_guide {
-        " What to do next? "
+        ui_language.text(" What to do next? ", " 接下來怎麼做？ ")
     } else if bootstrap_status_flow.is_some() {
-        " MCP bootstrap "
+        ui_language.text(" MCP bootstrap ", " MCP 初始化 ")
     } else {
-        " Status "
+        ui_language.text(" Status ", " 狀態 ")
     };
     let status_block = Block::default()
         .title(status_title)
@@ -4514,17 +5433,17 @@ fn draw_ui(
     // ── Keys ──
     let key_spans = vec![
         Span::styled("  [q]", Style::default().fg(palette.danger_fg)),
-        Span::raw(" Quit  "),
+        Span::raw(ui_language.text(" Quit  ", " 離開  ")),
         Span::styled("[Up/Down/Wheel]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Scroll  "),
+        Span::raw(ui_language.text(" Scroll  ", " 捲動  ")),
         Span::styled("[End]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Latest  "),
+        Span::raw(ui_language.text(" Latest  ", " 最新  ")),
         Span::styled("[e]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Export logs"),
+        Span::raw(ui_language.text(" Export logs", " 匯出紀錄")),
     ];
     let keys = Paragraph::new(Line::from(key_spans)).block(
         Block::default()
-            .title(" Keys ")
+            .title(ui_language.text(" Keys ", " 按鍵 "))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -4546,6 +5465,7 @@ fn draw_ui(
             &entry.message,
             log_secret_revealed_until.contains_key(&entry.id),
         );
+        let message = localize_log_message(&message, ui_language);
         let wrapped = wrap_log_message(&message, message_width);
         for (index, line) in wrapped.into_iter().enumerate() {
             let item = if index == 0 {
@@ -4595,7 +5515,7 @@ fn draw_ui(
         .collect();
     let logs = List::new(visible_items).block(
         Block::default()
-            .title(" Logs ")
+            .title(ui_language.text(" Logs ", " 紀錄 "))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
