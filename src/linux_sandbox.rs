@@ -96,6 +96,43 @@ fn insert_env_path(paths: &mut BTreeSet<PathBuf>, variable: &str) {
     }
 }
 
+fn insert_nvm_lib_path(paths: &mut BTreeSet<PathBuf>, nvm_bin: &Path, nvm_dir: &Path) {
+    let Ok(nvm_bin) = nvm_bin.canonicalize() else {
+        return;
+    };
+    let Ok(nvm_dir) = nvm_dir.canonicalize() else {
+        return;
+    };
+    if nvm_bin.file_name() != Some(OsStr::new("bin")) {
+        return;
+    }
+    let Some(version_root) = nvm_bin.parent() else {
+        return;
+    };
+    let Ok(node_versions) = nvm_dir.join("versions/node").canonicalize() else {
+        return;
+    };
+    if version_root.parent() != Some(node_versions.as_path()) {
+        return;
+    }
+    let Some(lib) = real_dir(&version_root.join("lib")) else {
+        return;
+    };
+    if lib.parent() != Some(version_root) {
+        return;
+    }
+
+    paths.insert(lib);
+}
+
+fn insert_nvm_read_paths(paths: &mut BTreeSet<PathBuf>) {
+    let (Some(nvm_bin), Some(nvm_dir)) = (std::env::var_os("NVM_BIN"), std::env::var_os("NVM_DIR"))
+    else {
+        return;
+    };
+    insert_nvm_lib_path(paths, Path::new(&nvm_bin), Path::new(&nvm_dir));
+}
+
 fn insert_ssh_read_paths(paths: &mut BTreeSet<PathBuf>, home: &Path) {
     let ssh_dir = home.join(".ssh");
     // Only regular metadata/public-key files are exposed. A *.pub directory
@@ -144,6 +181,10 @@ fn runtime_read_paths() -> BTreeSet<PathBuf> {
     // Executables installed outside the standard system prefixes must remain
     // executable when their directory is explicitly present in PATH.
     insert_env_path_list(&mut paths, "PATH");
+
+    // NVM's npm/npx launchers in NVM_BIN are symlinks into the sibling lib
+    // directory. Expose only that current version's lib tree, read-only.
+    insert_nvm_read_paths(&mut paths);
 
     // Rust toolchains are commonly installed under the user's home directory.
     // Expose only executable/cache trees from Cargo so registry credentials

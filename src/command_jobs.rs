@@ -113,6 +113,7 @@ struct CommandJob {
     command: String,
     workspace_root: PathBuf,
     cwd: PathBuf,
+    sandbox_enabled: bool,
     started_at: Instant,
     timeout_ms: u64,
     change_session: Option<ChangeSession>,
@@ -125,13 +126,14 @@ struct CommandJob {
 impl CommandJob {
     #[cfg(test)]
     fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
-        Self::new_with_change_session(command, cwd.clone(), cwd, timeout_ms, None)
+        Self::new_with_change_session(command, cwd.clone(), cwd, false, timeout_ms, None)
     }
 
     fn new_with_change_session(
         command: String,
         workspace_root: PathBuf,
         cwd: PathBuf,
+        sandbox_enabled: bool,
         timeout_ms: u64,
         change_session: Option<ChangeSession>,
     ) -> (Arc<Self>, watch::Receiver<bool>) {
@@ -142,6 +144,7 @@ impl CommandJob {
                 command,
                 workspace_root,
                 cwd,
+                sandbox_enabled,
                 started_at: Instant::now(),
                 timeout_ms,
                 change_session,
@@ -280,8 +283,16 @@ impl CommandJobManager {
         timeout_ms: u64,
         request_key: Option<String>,
     ) -> Result<StartCommandResult, String> {
-        self.start_with_change_session(command, cwd.clone(), cwd, timeout_ms, request_key, None)
-            .await
+        self.start_with_change_session(
+            command,
+            cwd.clone(),
+            cwd,
+            false,
+            timeout_ms,
+            request_key,
+            None,
+        )
+        .await
     }
 
     pub async fn start_with_change_session(
@@ -289,6 +300,7 @@ impl CommandJobManager {
         command: String,
         workspace_root: PathBuf,
         cwd: PathBuf,
+        sandbox_enabled: bool,
         timeout_ms: u64,
         request_key: Option<String>,
         change_session: Option<ChangeSession>,
@@ -319,6 +331,7 @@ impl CommandJobManager {
                 if job.command != command
                     || job.workspace_root != workspace_root
                     || job.cwd != cwd
+                    || job.sandbox_enabled != sandbox_enabled
                     || job.timeout_ms != timeout_ms
                 {
                     return Err(
@@ -356,6 +369,7 @@ impl CommandJobManager {
             command,
             workspace_root,
             cwd,
+            sandbox_enabled,
             timeout_ms,
             change_session,
         );
@@ -659,6 +673,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
         &job.command,
         &job.workspace_root,
         &job.cwd,
+        job.sandbox_enabled,
     )
     .await
     {
@@ -796,6 +811,7 @@ mod tests {
                 command.into(),
                 root.clone(),
                 root.clone(),
+                true,
                 5_000,
                 None,
                 Some(session),

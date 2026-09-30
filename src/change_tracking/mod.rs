@@ -92,6 +92,9 @@ impl ChangeSession {
     }
 }
 
+// Canonicalizing a workspace can change the root spelling (for example
+// macOS /var -> /private/var) or resolve a symlink. Keep targets that were
+// built from the original root in the same path namespace as the snapshot root.
 fn normalize_scope_paths(
     original_workspace_root: &Path,
     canonical_workspace_root: &Path,

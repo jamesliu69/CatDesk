@@ -62,6 +62,12 @@ const STATUS_LABEL_WIDTH: usize = 19;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
+const USAGE_VALUE_WIDTHS: [usize; 5] = [5, 5, 5, 5, 12];
+const FLOW_TELEMETRY_TOKEN_WIDTH: usize = 5;
+const FLOW_TELEMETRY_COST_WIDTH: usize = 9;
+const FLOW_TELEMETRY_REQUEST_WIDTH: usize = 3;
+const FLOW_TELEMETRY_ELAPSED_WIDTH: usize = 6;
+const USAGE_COUNT_ANIM_DURATION: Duration = Duration::from_millis(480);
 const CHATGPT_CONNECTOR_SETTINGS_URL: &str = "https://chatgpt.com/apps#settings/Connectors";
 const CHATGPT_PLUGIN_SETTINGS_URL: &str = "https://chatgpt.com/#settings/Plugins";
 
@@ -331,6 +337,44 @@ fn mcp_url_reveal_seconds(remaining: Duration) -> u64 {
         .as_millis()
         .div_ceil(1_000)
         .min(MCP_URL_REVEAL_DURATION.as_secs() as u128) as u64
+}
+
+fn reveal_button_span(label: &str, palette: &theme::Palette, hovered: bool) -> Span<'static> {
+    let style = if hovered {
+        Style::default()
+            .fg(palette.toast_fg)
+            .bg(palette.toast_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(palette.primary_fg)
+            .bg(palette.muted_fg)
+            .add_modifier(Modifier::BOLD)
+    };
+    Span::styled(format!(" {label} "), style)
+}
+
+fn reveal_button_hovered(
+    screen_lines: &[String],
+    column: u16,
+    row: u16,
+    ui_language: UiLanguage,
+) -> bool {
+    let Some(line) = screen_lines.get(row as usize) else {
+        return false;
+    };
+    if !(line.contains("MCP Server URL") || line.contains("MCP 伺服器 URL")) {
+        return false;
+    }
+    let label = ui_language.text("Click to reveal", "點擊顯示");
+    let Some(byte_start) = line.find(label) else {
+        return false;
+    };
+    let label_start = terminal_cell_width(&line[..byte_start]);
+    let button_start = label_start.saturating_sub(1);
+    let button_end = label_start + terminal_cell_width(label) + 1;
+    let column = column as usize;
+    (button_start..button_end).contains(&column)
 }
 
 fn post_mcp_path(message: &str) -> Option<&str> {
@@ -618,7 +662,8 @@ fn export_logs_to_dir(
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
     }
 
-    let path = directory.join(format_log_export_filename(local_now())?);
+    let now = local_now();
+    let path = directory.join(format_log_export_filename(now)?);
     let mut file = std::fs::File::create(&path)?;
     for entry in logs {
         let message = mask_secret_log_message(&entry.message, false);
@@ -659,70 +704,204 @@ fn formatted_usage_values(usage: &UsageTotals, cost_usd: f64) -> [String; 5] {
     ]
 }
 
-fn usage_value_widths(
-    first: &UsageTotals,
-    first_cost_usd: f64,
-    second: &UsageTotals,
-    second_cost_usd: f64,
-) -> [usize; 5] {
-    let first = formatted_usage_values(first, first_cost_usd);
-    let second = formatted_usage_values(second, second_cost_usd);
-    std::array::from_fn(|index| first[index].len().max(second[index].len()))
+#[derive(Clone, Debug)]
+struct UsageAnimationFrame {
+    usage: UsageTotals,
+    cost_usd: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageAnimationRow {
+    initialized: bool,
+    from_usage: UsageTotals,
+    target_usage: UsageTotals,
+    from_cost_usd: f64,
+    target_cost_usd: f64,
+    started_at: Option<Instant>,
+}
+
+impl UsageAnimationRow {
+    fn sample_values(&self, now: Instant) -> (UsageTotals, f64) {
+        if !self.initialized {
+            return (UsageTotals::default(), 0.0);
+        }
+
+        let progress = self
+            .started_at
+            .map(|started_at| {
+                (now.saturating_duration_since(started_at).as_secs_f64()
+                    / USAGE_COUNT_ANIM_DURATION.as_secs_f64())
+                .clamp(0.0, 1.0)
+            })
+            .unwrap_or(1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        let lerp_u64 = |from: u64, target: u64| -> u64 {
+            if target >= from {
+                from.saturating_add(((target - from) as f64 * eased).round() as u64)
+            } else {
+                from.saturating_sub(((from - target) as f64 * eased).round() as u64)
+            }
+        };
+
+        (
+            UsageTotals {
+                tool_input_tokens: lerp_u64(
+                    self.from_usage.tool_input_tokens,
+                    self.target_usage.tool_input_tokens,
+                ),
+                tool_output_tokens: lerp_u64(
+                    self.from_usage.tool_output_tokens,
+                    self.target_usage.tool_output_tokens,
+                ),
+                total_tokens: lerp_u64(
+                    self.from_usage.total_tokens,
+                    self.target_usage.total_tokens,
+                ),
+                tool_call_count: lerp_u64(
+                    self.from_usage.tool_call_count,
+                    self.target_usage.tool_call_count,
+                ),
+            },
+            self.from_cost_usd + (self.target_cost_usd - self.from_cost_usd) * eased,
+        )
+    }
+
+    fn update(
+        &mut self,
+        target_usage: &UsageTotals,
+        target_cost_usd: f64,
+        now: Instant,
+    ) -> UsageAnimationFrame {
+        if !self.initialized {
+            self.initialized = true;
+            self.from_usage = target_usage.clone();
+            self.target_usage = target_usage.clone();
+            self.from_cost_usd = target_cost_usd;
+            self.target_cost_usd = target_cost_usd;
+            return UsageAnimationFrame {
+                usage: target_usage.clone(),
+                cost_usd: target_cost_usd,
+            };
+        }
+
+        let target_changed = target_usage != &self.target_usage
+            || (target_cost_usd - self.target_cost_usd).abs() > f64::EPSILON;
+        if target_changed {
+            let decreased = target_usage.tool_input_tokens < self.target_usage.tool_input_tokens
+                || target_usage.tool_output_tokens < self.target_usage.tool_output_tokens
+                || target_usage.total_tokens < self.target_usage.total_tokens
+                || target_usage.tool_call_count < self.target_usage.tool_call_count
+                || target_cost_usd + f64::EPSILON < self.target_cost_usd;
+
+            if decreased {
+                self.from_usage = target_usage.clone();
+                self.target_usage = target_usage.clone();
+                self.from_cost_usd = target_cost_usd;
+                self.target_cost_usd = target_cost_usd;
+                self.started_at = None;
+            } else {
+                let (current_usage, current_cost_usd) = self.sample_values(now);
+                self.from_usage = current_usage;
+                self.target_usage = target_usage.clone();
+                self.from_cost_usd = current_cost_usd;
+                self.target_cost_usd = target_cost_usd;
+                self.started_at = Some(now);
+            }
+        }
+
+        let (usage, cost_usd) = self.sample_values(now);
+        if self.started_at.is_some_and(|started_at| {
+            now.saturating_duration_since(started_at) >= USAGE_COUNT_ANIM_DURATION
+        }) {
+            self.from_usage = self.target_usage.clone();
+            self.from_cost_usd = self.target_cost_usd;
+            self.started_at = None;
+        }
+
+        UsageAnimationFrame { usage, cost_usd }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UsageAnimationState {
+    session: UsageAnimationRow,
+    all_time: UsageAnimationRow,
+}
+
+impl UsageAnimationState {
+    fn frames(
+        &mut self,
+        session_usage: &UsageTotals,
+        session_cost_usd: f64,
+        all_time_usage: &UsageTotals,
+        all_time_cost_usd: f64,
+        now: Instant,
+    ) -> (UsageAnimationFrame, UsageAnimationFrame) {
+        (
+            self.session.update(session_usage, session_cost_usd, now),
+            self.all_time.update(all_time_usage, all_time_cost_usd, now),
+        )
+    }
+}
+
+fn usage_value_spans(value: &str, width: usize, base_color: Color) -> Vec<Span<'static>> {
+    vec![Span::styled(
+        format!("{value:<width$}"),
+        Style::default().fg(base_color).add_modifier(Modifier::BOLD),
+    )]
 }
 
 fn usage_line(
-    usage: &UsageTotals,
-    cost_usd: f64,
+    frame: &UsageAnimationFrame,
     status_label: Span<'static>,
     palette: &theme::Palette,
     value_widths: &[usize; 5],
     ui_language: UiLanguage,
 ) -> Line<'static> {
+    let annotation_style = Style::default().fg(palette.muted_fg);
     let label_style = Style::default().fg(palette.muted_fg);
-    let value_style = Style::default()
-        .fg(palette.secondary_fg)
-        .add_modifier(Modifier::BOLD);
-    let price_style = Style::default()
-        .fg(palette.success_fg)
-        .add_modifier(Modifier::BOLD);
-    let values = formatted_usage_values(usage, cost_usd);
+    let values = formatted_usage_values(&frame.usage, frame.cost_usd);
 
-    Line::from(vec![
-        status_label,
-        Span::styled("↓", label_style),
-        Span::styled(
-            format!("{:<width$}", values[0], width = value_widths[0]),
-            value_style,
-        ),
-        Span::styled(
-            ui_language.text(" (tool input, llm output)", "（工具輸入、LLM 輸出）"),
-            label_style,
-        ),
-        Span::raw("  "),
-        Span::styled("↑", label_style),
-        Span::styled(
-            format!("{:<width$}", values[1], width = value_widths[1]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("Σ", label_style),
-        Span::styled(
-            format!("{:<width$}", values[2], width = value_widths[2]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("ƒ", label_style),
-        Span::styled(
-            format!("{:<width$}", values[3], width = value_widths[3]),
-            value_style,
-        ),
-        Span::raw("  "),
-        Span::styled("$", label_style),
-        Span::styled(
-            format!("{:<width$}", values[4], width = value_widths[4]),
-            price_style,
-        ),
-    ])
+    let mut spans = vec![status_label, Span::styled("↓", label_style)];
+    spans.extend(usage_value_spans(
+        &values[0],
+        value_widths[0],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::styled(
+        ui_language.text(" (tool input, llm output)", "（工具輸入、LLM 輸出）"),
+        annotation_style,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("↑", label_style));
+    spans.extend(usage_value_spans(
+        &values[1],
+        value_widths[1],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("Σ", label_style));
+    spans.extend(usage_value_spans(
+        &values[2],
+        value_widths[2],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("ƒ", label_style));
+    spans.extend(usage_value_spans(
+        &values[3],
+        value_widths[3],
+        palette.secondary_fg,
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("$", label_style));
+    spans.extend(usage_value_spans(
+        &values[4],
+        value_widths[4],
+        palette.success_fg,
+    ));
+
+    Line::from(spans)
 }
 
 fn flow_lane_left_label(ui_language: UiLanguage) -> &'static str {
@@ -735,8 +914,23 @@ fn flow_call_offset(text: &str, left_label: &str) -> String {
     " ".repeat(terminal_cell_width(left_label) + centered_in_lane)
 }
 
-fn flow_turn_usage_line(
-    flow: &FlowLane,
+fn format_last_tool_call_elapsed(last_tool_call_ms: Option<u128>, now_millis: u128) -> String {
+    let Some(last_tool_call_ms) = last_tool_call_ms else {
+        return "--".to_string();
+    };
+    let elapsed_ms = now_millis.saturating_sub(last_tool_call_ms);
+    if elapsed_ms > 99_000 {
+        "99+ s".to_string()
+    } else {
+        format!("{:.1} s", elapsed_ms as f64 / 1_000.0)
+    }
+}
+
+fn flow_telemetry_line(
+    usage: Option<&UsageTotals>,
+    request_count: u64,
+    last_tool_call_ms: Option<u128>,
+    now_millis: u128,
     palette: &theme::Palette,
     ui_language: UiLanguage,
 ) -> Line<'static> {
@@ -747,41 +941,60 @@ fn flow_turn_usage_line(
     let price_style = Style::default()
         .fg(palette.success_fg)
         .add_modifier(Modifier::BOLD);
+    let meta_value_style = Style::default().fg(palette.title_fg);
 
-    match flow.turn_usage.as_ref() {
-        Some(usage) => {
-            let input = format_token_compact(usage.tool_input_tokens);
-            let output = format_token_compact(usage.tool_output_tokens);
-            let cost = format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage));
-            let usage_text = format!("↓{input}  ↑{output}  ${cost}");
-            let indent = format!(
-                "    {}",
-                flow_call_offset(&usage_text, flow_lane_left_label(ui_language))
-            );
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled("↓", label_style),
-                Span::styled(input, value_style),
-                Span::raw("  "),
-                Span::styled("↑", label_style),
-                Span::styled(output, value_style),
-                Span::raw("  "),
-                Span::styled("$", label_style),
-                Span::styled(cost, price_style),
-            ])
-        }
-        None => {
-            let usage_text = "↓--  ↑--  $--";
-            let indent = format!(
-                "    {}",
-                flow_call_offset(usage_text, flow_lane_left_label(ui_language))
-            );
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled(usage_text, label_style),
-            ])
-        }
-    }
+    let input = usage
+        .map(|usage| format_token_compact(usage.tool_input_tokens))
+        .unwrap_or_else(|| "--".to_string());
+    let output = usage
+        .map(|usage| format_token_compact(usage.tool_output_tokens))
+        .unwrap_or_else(|| "--".to_string());
+    let cost = usage
+        .map(|usage| format_usd_compact(estimate_gpt_5_6_and_earlier_usage_cost_usd(usage)))
+        .unwrap_or_else(|| "--".to_string());
+    let elapsed = format_last_tool_call_elapsed(last_tool_call_ms, now_millis);
+
+    let input_field = format!("{input:<FLOW_TELEMETRY_TOKEN_WIDTH$}");
+    let output_field = format!("{output:<FLOW_TELEMETRY_TOKEN_WIDTH$}");
+    let cost_field = format!("{cost:<FLOW_TELEMETRY_COST_WIDTH$}");
+    let request_field = format!("{request_count:<FLOW_TELEMETRY_REQUEST_WIDTH$}");
+    let elapsed_field = format!("{elapsed:>FLOW_TELEMETRY_ELAPSED_WIDTH$}");
+    let telemetry_text = format!(
+        "↓{input_field}  ↑{output_field}  ${cost_field}  ⟨Req {request_field}· {elapsed_field}⟩"
+    );
+    let indent = format!(
+        "    {}",
+        flow_call_offset(&telemetry_text, flow_lane_left_label(ui_language))
+    );
+
+    let usage_style = if usage.is_some() {
+        value_style
+    } else {
+        label_style
+    };
+    let cost_style = if usage.is_some() {
+        price_style
+    } else {
+        label_style
+    };
+
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled("↓", label_style),
+        Span::styled(input_field, usage_style),
+        Span::raw("  "),
+        Span::styled("↑", label_style),
+        Span::styled(output_field, usage_style),
+        Span::raw("  "),
+        Span::styled("$", label_style),
+        Span::styled(cost_field, cost_style),
+        Span::raw("  "),
+        Span::styled("⟨Req ", label_style),
+        Span::styled(request_field, meta_value_style),
+        Span::styled("· ", label_style),
+        Span::styled(elapsed_field, meta_value_style),
+        Span::styled("⟩", label_style),
+    ])
 }
 
 fn flow_phase(flow: &FlowLane, now_millis: u128) -> &'static str {
@@ -1353,11 +1566,15 @@ fn record_server_exit(app: &mut AppState, result: &Result<(), String>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
-    if linux_sandbox::is_helper_invocation() {
-        linux_sandbox::exec_helper()?;
-        unreachable!("Landlock helper returned after exec");
-    }
+    // rustls 0.23 refuses to pick a process-level CryptoProvider when more than
+    // one provider feature is enabled, and panics on first use. Both end up
+    // enabled here through feature unification: ngrok requires aws-lc-rs, while
+    // reqwest's rustls-tls pulls in ring. Install one explicitly instead of
+    // relying on automatic selection. aws-lc-rs is chosen because ngrok already
+    // requires it, so it is always present.
+    //
+    // An error means a provider was already installed, which is equally fine.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let runtime_mode = parse_runtime_mode(std::env::args()).map_err(std::io::Error::other)?;
 
@@ -1404,6 +1621,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(EnableBracketedPaste)?;
     stdout().execute(EnableMouseCapture)?;
 
+    // Restore the terminal if the thread driving the TUI panics. The normal
+    // teardown below only runs on the ordinary exit path, so without this a
+    // panic leaves raw mode and mouse capture enabled: the terminal keeps
+    // emitting SGR mouse reports such as `35;81;24M` that nothing consumes, and
+    // the shell stays unusable until the user runs `reset`.
+    //
+    // The hook is process-global, but tokio catches panics in spawned tasks and
+    // keeps the rest of the runtime alive. start_services launches axum before
+    // the TUI, so tearing the terminal down for any panic would corrupt a
+    // display that is still running. Restore only when the panicking thread is
+    // the one that set the terminal up.
     {
         let terminal_thread = std::thread::current().id();
         let default_hook = std::panic::take_hook();
@@ -1932,35 +2160,43 @@ fn draw_chatgpt_connector_refresh_notice(
             ];
             if mcp_url.is_some() {
                 spans.push(Span::raw("  "));
-                let security_text = mcp_url_security_status
-                    .as_deref()
-                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                let security_color = match mcp_url_reveal_remaining {
-                    Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
-                    Some(_) => palette.warning_fg,
-                    None => palette.muted_fg,
-                };
-                spans.push(Span::styled(
-                    security_text.to_string(),
-                    Style::default()
-                        .fg(security_color)
-                        .bg(modal_bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                if let Some(remaining) = mcp_url_reveal_remaining {
-                    let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
-                    spans.push(Span::raw("  "));
+                if mcp_url_reveal_remaining.is_none() {
+                    spans.push(reveal_button_span(
+                        ui_language.text("Click to reveal", "點擊顯示"),
+                        &palette,
+                        false,
+                    ));
+                } else {
+                    let security_text = mcp_url_security_status.as_deref().unwrap_or_default();
+                    let security_color = match mcp_url_reveal_remaining {
+                        Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                            palette.danger_fg
+                        }
+                        Some(_) => palette.warning_fg,
+                        None => palette.muted_fg,
+                    };
                     spans.push(Span::styled(
-                        remaining_bar,
+                        security_text.to_string(),
                         Style::default()
                             .fg(security_color)
                             .bg(modal_bg)
                             .add_modifier(Modifier::BOLD),
                     ));
-                    spans.push(Span::styled(
-                        elapsed_bar,
-                        Style::default().fg(palette.muted_fg).bg(modal_bg),
-                    ));
+                    if let Some(remaining) = mcp_url_reveal_remaining {
+                        let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(
+                            remaining_bar,
+                            Style::default()
+                                .fg(security_color)
+                                .bg(modal_bg)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            elapsed_bar,
+                            Style::default().fg(palette.muted_fg).bg(modal_bg),
+                        ));
+                    }
                 }
             }
             Line::from(spans)
@@ -2276,9 +2512,18 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_right_to_cell_width, terminal_cell_width};
+    use super::state::{AppState, ToolMode, UiLanguage};
+    use super::{
+        LogView, RuntimeMode, UsageAnimationState, apply_mode_selection_defaults,
+        draw_chatgpt_connector_refresh_notice, draw_mode_select, draw_settings, draw_tui_header,
+        draw_ui, export_logs_to_dir, localize_log_message, mask_mcp_path_in_log,
+        mode_selection_default_action, normalize_public_base_url_input, pad_right_to_cell_width,
+        parse_runtime_mode, record_server_exit, terminal_cell_width, trim_line, wrap_log_message,
+    };
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
     #[test]
     fn main_dashboard_renders_traditional_chinese() {
         let unique = SystemTime::now()
@@ -2298,6 +2543,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(180, 44)).expect("create terminal");
         let mut log_view = None;
         let revealed_logs = HashMap::new();
+        let mut usage_animation = UsageAnimationState::default();
         terminal
             .draw(|frame| {
                 draw_ui(
@@ -2308,7 +2554,9 @@ mod tests {
                     &mut log_view,
                     None,
                     None,
+                    false,
                     &revealed_logs,
+                    &mut usage_animation,
                 )
             })
             .expect("draw main dashboard");
@@ -2329,7 +2577,7 @@ mod tests {
             "選取的瀏覽器",
             "等待連線",
             "你的電腦",
-            "請求",
+            "Req",
             "按鍵",
             "離開",
             "捲動",
@@ -2347,91 +2595,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(workspace);
     }
-
-    #[test]
-    fn display_width_helpers_use_terminal_cells_for_cjk_text() {
-        assert_eq!(terminal_cell_width("abc"), 3);
-        assert_eq!(terminal_cell_width("繁中"), 4);
-        assert_eq!(terminal_cell_width(" 已複製！ "), 10);
-
-        let padded = pad_right_to_cell_width("繁中", 6);
-        assert_eq!(terminal_cell_width(&padded), 6);
-        assert_eq!(padded, "繁中  ");
-
-        let trimmed = trim_line("繁體中文測試", 7);
-        assert_eq!(trimmed, "繁體...");
-        assert_eq!(terminal_cell_width(&trimmed), 7);
-    }
-
-    #[test]
-    fn bootstrap_phase_lines_render_traditional_chinese() {
-        let palette = super::theme::all()[0].palette;
-        let lines = super::flow_phase_lines(
-            None,
-            super::ShowDetailMode::Expanded,
-            &palette,
-            ratatui::style::Style::default(),
-            UiLanguage::TraditionalChinese,
-            0,
-        );
-        let text = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-            .replace(' ', "");
-        assert!(text.contains("階段1連線中"));
-        assert!(text.contains("階段2載入Widget"));
-    }
-
-    #[test]
-    fn connector_refresh_notice_renders_traditional_chinese() {
-        let mut terminal = Terminal::new(TestBackend::new(120, 28)).expect("create terminal");
-        let theme = super::theme::all()[0];
-
-        terminal
-            .draw(|frame| {
-                draw_chatgpt_connector_refresh_notice(
-                    frame,
-                    &theme,
-                    UiLanguage::TraditionalChinese,
-                    Some("https://catdesk.example.com/secret/mcp"),
-                    None,
-                )
-            })
-            .expect("draw chinese connector refresh notice");
-
-        let text = terminal_buffer_text(&terminal).replace(' ', "");
-        for expected in [
-            "需要重新整理CatDeskConnector",
-            "此更新變更了Connector",
-            "移除CatDesk",
-            "找到CatDesk並點擊它",
-            "重新加入CatDesk",
-            "開啟Connector設定",
-            "填寫表單",
-            "名稱│CatDesk",
-            "MCP伺服器URL",
-            "點擊顯示",
-            "複製設定連結",
-            "我已重新加入CatDesk",
-            "下次啟動再提醒我",
-        ] {
-            assert!(
-                text.contains(expected),
-                "missing translated text: {expected}"
-            );
-        }
-    }
-
-    use super::state::{AppState, ToolMode, UiLanguage};
-    use super::{
-        LogView, RuntimeMode, apply_mode_selection_defaults, draw_chatgpt_connector_refresh_notice,
-        draw_mode_select, draw_settings, draw_tui_header, draw_ui, export_logs_to_dir,
-        mask_mcp_path_in_log, mode_selection_default_action, normalize_public_base_url_input,
-        parse_runtime_mode, record_server_exit, trim_line, wrap_log_message,
-    };
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     fn terminal_buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
@@ -2521,6 +2684,8 @@ mod tests {
         assert!(chinese_compact.contains("控制電腦"));
         assert!(chinese_compact.contains("控制瀏覽器"));
         assert!(chinese_compact.contains("語言：繁體中文"));
+        assert!(chinese_compact.contains("主題簡潔"));
+        assert!(chinese_compact.contains("工具模式多工具"));
         assert!(chinese_compact.contains("離開"));
     }
 
@@ -2529,6 +2694,210 @@ mod tests {
         assert_eq!(
             normalize_public_base_url_input("  https://catdesk.example.com/  ").unwrap(),
             "https://catdesk.example.com"
+        );
+    }
+
+    #[test]
+    fn flow_telemetry_renders_request_meta() {
+        let palette = super::theme::resolve("neon").palette;
+        let usage = super::state::UsageTotals {
+            tool_input_tokens: 22,
+            tool_output_tokens: 217,
+            total_tokens: 239,
+            tool_call_count: 1,
+        };
+        let line = super::flow_telemetry_line(
+            Some(&usage),
+            22,
+            Some(10_000),
+            91_600,
+            &palette,
+            UiLanguage::English,
+        );
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("⟨Req 22 · 81.6 s⟩"));
+    }
+
+    #[test]
+    fn flow_telemetry_does_not_shift_when_values_gain_digits() {
+        let palette = super::theme::resolve("neon").palette;
+        let before = super::state::UsageTotals {
+            tool_input_tokens: 9,
+            tool_output_tokens: 99,
+            total_tokens: 108,
+            tool_call_count: 1,
+        };
+        let after = super::state::UsageTotals {
+            tool_input_tokens: 10,
+            tool_output_tokens: 100,
+            total_tokens: 110,
+            tool_call_count: 1,
+        };
+
+        let line_text = |usage: &super::state::UsageTotals, requests, now_millis| {
+            super::flow_telemetry_line(
+                Some(usage),
+                requests,
+                Some(10_000),
+                now_millis,
+                &palette,
+                UiLanguage::English,
+            )
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+        };
+
+        let before_text = line_text(&before, 9, 19_900);
+        let after_text = line_text(&after, 10, 20_000);
+        assert_eq!(
+            before_text.chars().take_while(|ch| *ch == ' ').count(),
+            after_text.chars().take_while(|ch| *ch == ' ').count()
+        );
+        assert_eq!(
+            super::terminal_cell_width(&before_text),
+            super::terminal_cell_width(&after_text)
+        );
+    }
+
+    #[test]
+    fn usage_line_columns_do_not_shift_when_values_gain_digits() {
+        let palette = super::theme::resolve("neon").palette;
+        let before = super::UsageAnimationFrame {
+            usage: super::state::UsageTotals {
+                tool_input_tokens: 9,
+                tool_output_tokens: 99,
+                total_tokens: 108,
+                tool_call_count: 9,
+            },
+            cost_usd: 0.001,
+        };
+        let after = super::UsageAnimationFrame {
+            usage: super::state::UsageTotals {
+                tool_input_tokens: 10,
+                tool_output_tokens: 100,
+                total_tokens: 110,
+                tool_call_count: 10,
+            },
+            cost_usd: 0.01,
+        };
+
+        let line_text = |frame: &super::UsageAnimationFrame| {
+            super::usage_line(
+                frame,
+                ratatui::text::Span::raw("Session "),
+                &palette,
+                &super::USAGE_VALUE_WIDTHS,
+                UiLanguage::English,
+            )
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+        };
+
+        let before_text = line_text(&before);
+        let after_text = line_text(&after);
+        for marker in ['↑', 'Σ', 'ƒ', '$'] {
+            assert_eq!(
+                before_text.find(marker),
+                after_text.find(marker),
+                "{marker} column shifted"
+            );
+        }
+        assert_eq!(
+            super::terminal_cell_width(&before_text),
+            super::terminal_cell_width(&after_text)
+        );
+    }
+
+    #[test]
+    fn reveal_button_uses_compact_normal_and_hover_styles() {
+        let palette = super::theme::resolve("neon").palette;
+
+        let normal = super::reveal_button_span("Click to reveal", &palette, false);
+        assert_eq!(normal.content.as_ref(), " Click to reveal ");
+        assert_eq!(normal.style.fg, Some(palette.primary_fg));
+        assert_eq!(normal.style.bg, Some(palette.muted_fg));
+
+        let hovered = super::reveal_button_span("Click to reveal", &palette, true);
+        assert_eq!(hovered.content.as_ref(), " Click to reveal ");
+        assert_eq!(hovered.style.fg, Some(palette.toast_fg));
+        assert_eq!(hovered.style.bg, Some(palette.toast_bg));
+        assert!(
+            hovered
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn reveal_button_hover_detects_only_button_cells() {
+        let line = "  MCP Server URL  ▓▓▓▓  Click to reveal  ";
+        let lines = vec![line.to_string()];
+        let label_start = super::terminal_cell_width("  MCP Server URL  ▓▓▓▓  ");
+        assert!(super::reveal_button_hovered(
+            &lines,
+            label_start as u16,
+            0,
+            UiLanguage::English,
+        ));
+        assert!(!super::reveal_button_hovered(
+            &lines,
+            0,
+            0,
+            UiLanguage::English,
+        ));
+    }
+
+    #[test]
+    fn formats_last_tool_call_elapsed() {
+        assert_eq!(super::format_last_tool_call_elapsed(None, 12_300), "--");
+        assert_eq!(
+            super::format_last_tool_call_elapsed(Some(10_000), 22_300),
+            "12.3 s"
+        );
+        assert_eq!(
+            super::format_last_tool_call_elapsed(Some(1_000), 100_000),
+            "99.0 s"
+        );
+        assert_eq!(
+            super::format_last_tool_call_elapsed(Some(1_000), 100_001),
+            "99+ s"
+        );
+    }
+
+    #[test]
+    fn parses_terminal_profile_choice() {
+        assert_eq!(
+            crate::macos_terminal::parse_terminal_profile_choice(""),
+            Some(true)
+        );
+        assert_eq!(
+            crate::macos_terminal::parse_terminal_profile_choice(" y "),
+            Some(true)
+        );
+        assert_eq!(
+            crate::macos_terminal::parse_terminal_profile_choice("YES"),
+            Some(true)
+        );
+        assert_eq!(
+            crate::macos_terminal::parse_terminal_profile_choice("n"),
+            Some(false)
+        );
+        assert_eq!(
+            crate::macos_terminal::parse_terminal_profile_choice(" No "),
+            Some(false)
+        );
+        assert_eq!(
+            crate::macos_terminal::parse_terminal_profile_choice("maybe"),
+            None
         );
     }
 
@@ -2583,6 +2952,79 @@ mod tests {
 
         let hard_wrapped = wrap_log_message("abcdefghijkl", 5);
         assert_eq!(hard_wrapped, vec!["abcde", "fghij", "kl"]);
+
+        let cjk_wrapped = wrap_log_message("中文測試", 6);
+        assert_eq!(cjk_wrapped, vec!["中文測", "試"]);
+        assert!(
+            cjk_wrapped
+                .iter()
+                .all(|line| terminal_cell_width(line) <= 6)
+        );
+    }
+
+    #[test]
+    fn display_width_helpers_use_terminal_cells_for_cjk_text() {
+        assert_eq!(terminal_cell_width("abc"), 3);
+        assert_eq!(terminal_cell_width("繁中"), 4);
+        assert_eq!(terminal_cell_width(" 已複製！ "), 10);
+
+        let padded = pad_right_to_cell_width("繁中", 6);
+        assert_eq!(terminal_cell_width(&padded), 6);
+        assert_eq!(padded, "繁中  ");
+
+        let trimmed = trim_line("繁體中文測試", 7);
+        assert_eq!(trimmed, "繁體...");
+        assert_eq!(terminal_cell_width(&trimmed), 7);
+    }
+
+    #[test]
+    fn traditional_chinese_runtime_logs_translate_operator_facing_messages() {
+        let zh = UiLanguage::TraditionalChinese;
+        for (english, expected) in [
+            ("Mode: Both", "模式：兩者"),
+            ("Theme changed to neon", "主題已切換為 霓虹"),
+            ("Tool mode: read-only", "工具模式：唯讀"),
+            ("Widget detail mode: Expanded", "Widget 詳細模式：展開"),
+            (
+                "Set CatDesk as co-author: enabled",
+                "將 CatDesk 設為共同作者：已啟用",
+            ),
+            ("Local browsers: Google Chrome", "本機瀏覽器：Google Chrome"),
+            (
+                "Using browser: Google Chrome (/Applications/Google Chrome.app) -> launch new browser instance",
+                "使用瀏覽器：Google Chrome (/Applications/Google Chrome.app) -> 啟動新的瀏覽器執行個體",
+            ),
+            (
+                "Failed to launch Google Chrome with remote debugging: denied",
+                "無法以遠端除錯模式啟動 Google Chrome：denied",
+            ),
+            (
+                "← JSON-RPC parse error bytes=12 message=bad",
+                "← JSON-RPC 解析錯誤 bytes=12 message=bad",
+            ),
+        ] {
+            assert_eq!(localize_log_message(english, zh), expected, "{english}");
+        }
+
+        assert_eq!(
+            localize_log_message("Mode: Both", UiLanguage::English),
+            "Mode: Both"
+        );
+    }
+
+    #[test]
+    fn exported_log_filename_includes_utc_offset() {
+        let utc = time::OffsetDateTime::from_unix_timestamp(0).expect("unix epoch");
+        assert_eq!(
+            super::format_log_export_filename(utc).expect("format UTC filename"),
+            "catdesk-19700101-000000-000Z.log"
+        );
+
+        let seoul = utc.to_offset(time::UtcOffset::from_hms(9, 0, 0).expect("UTC+09"));
+        assert_eq!(
+            super::format_log_export_filename(seoul).expect("format local filename"),
+            "catdesk-19700101-090000-000+0900.log"
+        );
     }
 
     #[test]
@@ -2609,10 +3051,13 @@ mod tests {
                     super::WidgetCornerStyle::Rounded,
                     UiLanguage::TraditionalChinese,
                     false,
+                    false,
+                    false,
                     "test-slug",
                     None,
                     &super::UsageTotals::default(),
                     0,
+                    false,
                     false,
                 )
             })
@@ -2657,6 +3102,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(180, 50)).expect("create terminal");
         let mut log_view = None;
         let secret_reveals = std::collections::HashMap::new();
+        let mut usage_animation = UsageAnimationState::default();
         terminal
             .draw(|frame| {
                 draw_ui(
@@ -2667,7 +3113,9 @@ mod tests {
                     &mut log_view,
                     None,
                     None,
+                    false,
                     &secret_reveals,
+                    &mut usage_animation,
                 )
             })
             .expect("draw localized main UI");
@@ -2685,7 +3133,7 @@ mod tests {
             "遠端除錯支援",
             "選取的瀏覽器",
             "你的電腦",
-            "請求",
+            "Req",
             "按鍵",
             "離開",
             "捲動",
@@ -2702,21 +3150,6 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(config_path);
-    }
-
-    #[test]
-    fn exported_log_filename_includes_utc_offset() {
-        let utc = time::OffsetDateTime::from_unix_timestamp(0).expect("unix epoch");
-        assert_eq!(
-            super::format_log_export_filename(utc).expect("format UTC filename"),
-            "catdesk-19700101-000000-000Z.log"
-        );
-
-        let taipei = utc.to_offset(time::UtcOffset::from_hms(8, 0, 0).expect("UTC+08"));
-        assert_eq!(
-            super::format_log_export_filename(taipei).expect("format local filename"),
-            "catdesk-19700101-080000-000+0800.log"
-        );
     }
 
     #[test]
@@ -2792,6 +3225,46 @@ mod tests {
     }
 
     #[test]
+    fn connector_refresh_notice_renders_traditional_chinese() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 28)).expect("create terminal");
+        let theme = super::theme::all()[0];
+
+        terminal
+            .draw(|frame| {
+                draw_chatgpt_connector_refresh_notice(
+                    frame,
+                    &theme,
+                    UiLanguage::TraditionalChinese,
+                    Some("https://example.ngrok.app/secret/mcp"),
+                    None,
+                )
+            })
+            .expect("draw chinese connector refresh notice");
+
+        let text = terminal_buffer_text(&terminal).replace(' ', "");
+        for expected in [
+            "需要重新整理CatDeskConnector",
+            "此更新變更了Connector",
+            "移除CatDesk",
+            "找到CatDesk並點擊它",
+            "重新加入CatDesk",
+            "開啟Connector設定",
+            "填寫表單",
+            "名稱│CatDesk",
+            "MCP伺服器URL",
+            "點擊顯示",
+            "複製設定連結",
+            "我已重新加入CatDesk",
+            "下次啟動再提醒我",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing translated text: {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn connector_refresh_notice_reveals_mcp_url_with_same_security_ui() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
@@ -2858,6 +3331,27 @@ mod tests {
         assert_eq!(disabled.len(), 1);
         assert_eq!(expanded.len(), 2);
         assert_eq!(collapsed.len(), 2);
+    }
+
+    #[test]
+    fn bootstrap_phase_lines_render_traditional_chinese() {
+        let palette = super::theme::all()[0].palette;
+        let lines = super::flow_phase_lines(
+            None,
+            super::ShowDetailMode::Expanded,
+            &palette,
+            ratatui::style::Style::default(),
+            UiLanguage::TraditionalChinese,
+            0,
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(text.contains("階段1連線中"));
+        assert!(text.contains("階段2載入Widget"));
     }
 
     #[test]
@@ -3000,12 +3494,13 @@ async fn run_settings(
         .map(|config| config.widget_corner_style)
         .unwrap_or_default();
     let mut confirm_reset_token_billing = false;
+    let mut confirm_disable_sandbox = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
     let total_rows =
-        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 4;
+        themes.len() + tool_modes.len() + show_detail_modes.len() + widget_corner_styles.len() + 6;
 
     loop {
         let (
@@ -3015,6 +3510,8 @@ async fn run_settings(
             current_ui_language,
             usage_totals,
             set_catdesk_as_co_author,
+            sandbox_enabled,
+            handoff_enabled,
             mcp_slug,
             public_base_url,
         ) = {
@@ -3026,6 +3523,8 @@ async fn run_settings(
                 app.ui_language,
                 app.all_time_usage_totals(),
                 app.set_catdesk_as_co_author,
+                app.sandbox_enabled,
+                app.handoff_enabled,
                 app.mcp_slug.clone(),
                 app.public_base_url.clone(),
             )
@@ -3039,11 +3538,14 @@ async fn run_settings(
                 current_widget_corner_style,
                 current_ui_language,
                 set_catdesk_as_co_author,
+                sandbox_enabled,
+                handoff_enabled,
                 &mcp_slug,
                 public_base_url.as_deref(),
                 &usage_totals,
                 selected_row,
                 confirm_reset_token_billing,
+                confirm_disable_sandbox,
             )
         })?;
 
@@ -3056,10 +3558,12 @@ async fn run_settings(
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Up => {
                         confirm_reset_token_billing = false;
+                        confirm_disable_sandbox = false;
                         selected_row = selected_row.saturating_sub(1);
                     }
                     KeyCode::Down => {
                         confirm_reset_token_billing = false;
+                        confirm_disable_sandbox = false;
                         if selected_row + 1 < total_rows {
                             selected_row += 1;
                         }
@@ -3125,6 +3629,22 @@ async fn run_settings(
                                         }
                                     }
                                 } else if selected_row == corner_end {
+                                    if app.sandbox_enabled && !confirm_disable_sandbox {
+                                        confirm_disable_sandbox = true;
+                                        continue;
+                                    }
+                                    app.sandbox_enabled = !app.sandbox_enabled;
+                                    let enabled = app.sandbox_enabled;
+                                    app.log(
+                                        "INFO",
+                                        format!(
+                                            "Command sandbox: {}",
+                                            if enabled { "enabled" } else { "disabled" }
+                                        ),
+                                    );
+                                    app.persist_state_with_log();
+                                    confirm_disable_sandbox = false;
+                                } else if selected_row == corner_end + 1 {
                                     app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
                                     let enabled = app.set_catdesk_as_co_author;
                                     app.log(
@@ -3135,13 +3655,24 @@ async fn run_settings(
                                         ),
                                     );
                                     app.persist_state_with_log();
-                                } else if selected_row == corner_end + 1 {
-                                    // Keep existing slug, do nothing
                                 } else if selected_row == corner_end + 2 {
+                                    app.handoff_enabled = !app.handoff_enabled;
+                                    let enabled = app.handoff_enabled;
+                                    app.log(
+                                        "INFO",
+                                        format!(
+                                            "Library handoff: {}",
+                                            if enabled { "enabled" } else { "disabled" }
+                                        ),
+                                    );
+                                    app.persist_state_with_log();
+                                } else if selected_row == corner_end + 3 {
+                                    // Keep existing slug, do nothing
+                                } else if selected_row == corner_end + 4 {
                                     app.regenerate_mcp_slug();
                                     app.log("INFO", "Generated new random MCP slug".into());
                                     app.persist_state_with_log();
-                                } else if selected_row == corner_end + 3 {
+                                } else if selected_row == corner_end + 5 {
                                     let current_url =
                                         app.public_base_url.clone().unwrap_or_default();
                                     drop(app);
@@ -3179,6 +3710,7 @@ async fn run_settings(
                         }
                     }
                     KeyCode::Char('r') => {
+                        confirm_disable_sandbox = false;
                         if !confirm_reset_token_billing {
                             confirm_reset_token_billing = true;
                             continue;
@@ -3191,6 +3723,7 @@ async fn run_settings(
                     }
                     _ => {
                         confirm_reset_token_billing = false;
+                        confirm_disable_sandbox = false;
                     }
                 }
             }
@@ -3206,11 +3739,14 @@ fn draw_settings(
     current_widget_corner_style: WidgetCornerStyle,
     ui_language: UiLanguage,
     set_catdesk_as_co_author: bool,
+    sandbox_enabled: bool,
+    handoff_enabled: bool,
     mcp_slug: &str,
     public_base_url: Option<&str>,
     usage_totals: &UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
+    confirm_disable_sandbox: bool,
 ) {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
@@ -3418,7 +3954,73 @@ fn draw_settings(
         )]));
     }
 
-    let co_author_row = widget_corner_start + widget_corner_styles.len();
+    let sandbox_row = widget_corner_start + widget_corner_styles.len();
+    let sandbox_selected = sandbox_row == selected_row;
+    let sandbox_marker = if sandbox_selected { ">" } else { " " };
+    let sandbox_name_style = if sandbox_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text("  Command sandbox", "  指令沙盒"),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    if sandbox_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] {}",
+            sandbox_marker,
+            sandbox_row + 1,
+            ui_language.text(
+                "Sandbox run_command and start_command",
+                "用沙盒執行 run_command 和 start_command"
+            )
+        ),
+        sandbox_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            if sandbox_enabled {
+                ui_language.text("[enabled]", "[已啟用]")
+            } else {
+                ui_language.text("[disabled]", "[已停用]")
+            },
+            Style::default().fg(if sandbox_enabled {
+                palette.success_fg
+            } else {
+                palette.danger_fg
+            }),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        if confirm_disable_sandbox {
+            ui_language.text(
+                "     Warning: disabling runs Linux commands directly through /bin/bash. Press Enter again to confirm.",
+                "     警告：停用後 Linux 指令會直接透過 /bin/bash 執行。再按一次 Enter 確認。",
+            )
+        } else {
+            ui_language.text(
+                "     On Linux, enabled uses bubblewrap; disabled runs directly through /bin/bash.",
+                "     在 Linux 上，啟用時使用 bubblewrap；停用時直接透過 /bin/bash 執行。",
+            )
+        },
+        Style::default().fg(if confirm_disable_sandbox {
+            palette.danger_fg
+        } else {
+            palette.muted_fg
+        }),
+    )]));
+
+    let co_author_row = sandbox_row + 1;
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -3471,7 +4073,59 @@ fn draw_settings(
         Style::default().fg(palette.muted_fg),
     )]));
 
-    let slug_keep_row = co_author_row + 1;
+    let handoff_row = co_author_row + 1;
+    let handoff_selected = handoff_row == selected_row;
+    let handoff_marker = if handoff_selected { ">" } else { " " };
+    let handoff_name_style = if handoff_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text("  Session continuity", "  Session 延續"),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    if handoff_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] {}",
+            handoff_marker,
+            handoff_row + 1,
+            ui_language.text("Enable Library handoff", "啟用 Library handoff")
+        ),
+        handoff_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            if handoff_enabled {
+                ui_language.text("[enabled]", "[已啟用]")
+            } else {
+                ui_language.text("[disabled]", "[已停用]")
+            },
+            Style::default().fg(if handoff_enabled {
+                palette.success_fg
+            } else {
+                palette.muted_fg
+            }),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        ui_language.text(
+            "     When enabled, CatDesk exposes create_handoff and adds ChatGPT Library continuity guidance.",
+            "     啟用後，CatDesk 會提供 create_handoff，並加入 ChatGPT Library 延續指引。",
+        ),
+        Style::default().fg(palette.muted_fg),
+    )]));
+
+    let slug_keep_row = handoff_row + 1;
     let slug_keep_selected = slug_keep_row == selected_row;
     let slug_keep_marker = if slug_keep_selected { ">" } else { " " };
     let slug_keep_name_style = if slug_keep_selected {
@@ -3482,7 +4136,7 @@ fn draw_settings(
         Style::default().fg(palette.primary_fg)
     };
 
-    let slug_new_row = co_author_row + 2;
+    let slug_new_row = slug_keep_row + 1;
     let slug_new_selected = slug_new_row == selected_row;
     let slug_new_marker = if slug_new_selected { ">" } else { " " };
     let slug_new_name_style = if slug_new_selected {
@@ -3493,7 +4147,7 @@ fn draw_settings(
         Style::default().fg(palette.primary_fg)
     };
 
-    let public_url_row = co_author_row + 3;
+    let public_url_row = slug_new_row + 1;
     let public_url_selected = public_url_row == selected_row;
     let public_url_marker = if public_url_selected { ">" } else { " " };
     let public_url_name_style = if public_url_selected {
@@ -4459,7 +5113,9 @@ async fn run_tui(
     #[allow(unused_assignments)]
     let mut last_mcp_url: Option<String> = None;
     let mut mcp_url_revealed_until: Option<Instant> = None;
+    let mut mcp_reveal_button_hovered = false;
     let mut log_secret_revealed_until: HashMap<u64, Instant> = HashMap::new();
+    let mut usage_animation = UsageAnimationState::default();
 
     loop {
         {
@@ -4493,7 +5149,9 @@ async fn run_tui(
                     &mut latest_log_view,
                     toast_ref,
                     reveal_remaining,
+                    mcp_reveal_button_hovered,
                     &log_secret_revealed_until,
+                    &mut usage_animation,
                 );
 
                 if let Some(((c0, r0), (c1, r1))) = selection.range() {
@@ -4774,6 +5432,14 @@ async fn run_tui(
                             }
                         }
                     }
+                    MouseEventKind::Moved => {
+                        mcp_reveal_button_hovered = reveal_button_hovered(
+                            &screen_lines,
+                            mouse.column,
+                            mouse.row,
+                            current_ui_language,
+                        );
+                    }
                     MouseEventKind::ScrollUp => {
                         if log_follow_tail {
                             log_follow_tail = false;
@@ -4810,7 +5476,9 @@ fn draw_ui(
     log_view: &mut Option<LogView>,
     toast: Option<(&str, (u16, u16))>,
     mcp_url_reveal_remaining: Option<Duration>,
+    mcp_reveal_button_hovered: bool,
     log_secret_revealed_until: &HashMap<u64, Instant>,
+    usage_animation: &mut UsageAnimationState,
 ) {
     let palette = app.current_theme().palette;
     let ui_language = app.ui_language;
@@ -4928,18 +5596,6 @@ fn draw_ui(
     let lane_for = |active: bool, flow: Option<&FlowLane>| -> Vec<Span<'static>> {
         flow_lane_spans(active, flow, &palette, now_millis)
     };
-    let request_stats_for = |app: &AppState| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(
-                ui_language.text("  Requests ", "  請求 "),
-                Style::default().fg(palette.muted_fg),
-            ),
-            Span::styled(
-                app.request_count.to_string(),
-                Style::default().fg(palette.title_fg),
-            ),
-        ]
-    };
     let status_label_style = Style::default()
         .fg(palette.primary_fg)
         .add_modifier(Modifier::BOLD);
@@ -4956,11 +5612,13 @@ fn draw_ui(
     let session_usage_cost_usd =
         estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
     let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
-    let usage_widths = usage_value_widths(
+    let usage_widths = USAGE_VALUE_WIDTHS;
+    let (session_usage_frame, all_time_usage_frame) = usage_animation.frames(
         &app.session_usage_totals,
         session_usage_cost_usd,
         &all_time_usage_totals,
         all_time_usage_cost_usd,
+        Instant::now(),
     );
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
@@ -5021,33 +5679,42 @@ fn draw_ui(
             ];
             if has_url {
                 spans.push(Span::raw("  "));
-                let security_text = mcp_url_security_status
-                    .as_deref()
-                    .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                let security_color = match mcp_url_reveal_remaining {
-                    Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
-                    Some(_) => palette.warning_fg,
-                    None => palette.muted_fg,
-                };
-                spans.push(Span::styled(
-                    security_text.to_string(),
-                    Style::default()
-                        .fg(security_color)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                if let Some(remaining) = mcp_url_reveal_remaining {
-                    let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
-                    spans.push(Span::raw("  "));
+
+                if mcp_url_reveal_remaining.is_none() {
+                    spans.push(reveal_button_span(
+                        ui_language.text("Click to reveal", "點擊顯示"),
+                        &palette,
+                        mcp_reveal_button_hovered,
+                    ));
+                } else {
+                    let security_text = mcp_url_security_status.as_deref().unwrap_or_default();
+                    let security_color = match mcp_url_reveal_remaining {
+                        Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                            palette.danger_fg
+                        }
+                        Some(_) => palette.warning_fg,
+                        None => palette.muted_fg,
+                    };
                     spans.push(Span::styled(
-                        remaining_bar,
+                        security_text.to_string(),
                         Style::default()
                             .fg(security_color)
                             .add_modifier(Modifier::BOLD),
                     ));
-                    spans.push(Span::styled(
-                        elapsed_bar,
-                        Style::default().fg(palette.muted_fg),
-                    ));
+                    if let Some(remaining) = mcp_url_reveal_remaining {
+                        let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(
+                            remaining_bar,
+                            Style::default()
+                                .fg(security_color)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            elapsed_bar,
+                            Style::default().fg(palette.muted_fg),
+                        ));
+                    }
                 }
             }
             Line::from(spans)
@@ -5081,16 +5748,14 @@ fn draw_ui(
             Line::from(spans)
         },
         usage_line(
-            &app.session_usage_totals,
-            session_usage_cost_usd,
+            &session_usage_frame,
             status_label(ui_language.text("Session", "本次工作階段")),
             &palette,
             &usage_widths,
             ui_language,
         ),
         usage_line(
-            &all_time_usage_totals,
-            all_time_usage_cost_usd,
+            &all_time_usage_frame,
             status_label(ui_language.text("All-time", "累計")),
             &palette,
             &usage_widths,
@@ -5157,9 +5822,15 @@ fn draw_ui(
             ];
             row.extend(lane);
             row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-            row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
-            row.extend(request_stats_for(app));
             status_lines.push(Line::from(row));
+            status_lines.push(flow_telemetry_line(
+                None,
+                app.request_count,
+                app.last_tool_call_ms,
+                now_millis,
+                &palette,
+                ui_language,
+            ));
         } else {
             for flow in app
                 .flows
@@ -5186,10 +5857,16 @@ fn draw_ui(
                 ];
                 row.extend(lane);
                 row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-                row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
-                row.extend(request_stats_for(app));
                 status_lines.push(Line::from(row));
-                status_lines.push(flow_turn_usage_line(flow, &palette, ui_language));
+
+                status_lines.push(flow_telemetry_line(
+                    flow.turn_usage.as_ref(),
+                    app.request_count,
+                    app.last_tool_call_ms,
+                    now_millis,
+                    &palette,
+                    ui_language,
+                ));
             }
         }
     }
@@ -5315,36 +5992,44 @@ fn draw_ui(
                     ];
                     if has_url {
                         spans.push(Span::raw("  "));
-                        let security_text = mcp_url_security_status
-                            .as_deref()
-                            .unwrap_or(ui_language.text("Click to reveal", "點擊顯示"));
-                        let security_color = match mcp_url_reveal_remaining {
-                            Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
-                                palette.danger_fg
-                            }
-                            Some(_) => palette.warning_fg,
-                            None => palette.muted_fg,
-                        };
-                        spans.push(Span::styled(
-                            security_text.to_string(),
-                            Style::default()
-                                .fg(security_color)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                        if let Some(remaining) = mcp_url_reveal_remaining {
-                            let (remaining_bar, elapsed_bar) =
-                                mcp_url_reveal_bar_segments(remaining);
-                            spans.push(Span::raw("  "));
+
+                        if mcp_url_reveal_remaining.is_none() {
+                            spans.push(reveal_button_span(
+                                ui_language.text("Click to reveal", "點擊顯示"),
+                                &palette,
+                                mcp_reveal_button_hovered,
+                            ));
+                        } else {
+                            let security_text =
+                                mcp_url_security_status.as_deref().unwrap_or_default();
+                            let security_color = match mcp_url_reveal_remaining {
+                                Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                                    palette.danger_fg
+                                }
+                                Some(_) => palette.warning_fg,
+                                None => palette.muted_fg,
+                            };
                             spans.push(Span::styled(
-                                remaining_bar,
+                                security_text.to_string(),
                                 Style::default()
                                     .fg(security_color)
                                     .add_modifier(Modifier::BOLD),
                             ));
-                            spans.push(Span::styled(
-                                elapsed_bar,
-                                Style::default().fg(palette.muted_fg),
-                            ));
+                            if let Some(remaining) = mcp_url_reveal_remaining {
+                                let (remaining_bar, elapsed_bar) =
+                                    mcp_url_reveal_bar_segments(remaining);
+                                spans.push(Span::raw("  "));
+                                spans.push(Span::styled(
+                                    remaining_bar,
+                                    Style::default()
+                                        .fg(security_color)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                                spans.push(Span::styled(
+                                    elapsed_bar,
+                                    Style::default().fg(palette.muted_fg),
+                                ));
+                            }
                         }
                     }
                     Line::from(spans)

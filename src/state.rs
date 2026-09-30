@@ -349,12 +349,20 @@ pub struct AppConfig {
     pub partner_binagotchy_seed: Option<String>,
     #[serde(default)]
     pub set_catdesk_as_co_author: bool,
+    #[serde(default)]
+    pub handoff_enabled: bool,
+    #[serde(default = "default_sandbox_enabled")]
+    pub sandbox_enabled: bool,
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
     #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub selected_browser: Option<DetectedBrowser>,
+}
+
+fn default_sandbox_enabled() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -372,6 +380,8 @@ impl Default for AppConfig {
             ui_language: UiLanguage::English,
             partner_binagotchy_seed: None,
             set_catdesk_as_co_author: false,
+            handoff_enabled: false,
+            sandbox_enabled: true,
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
@@ -703,6 +713,8 @@ pub struct AppState {
     pub mascot_seed: u64,
     pub partner_binagotchy_seed: Option<String>,
     pub set_catdesk_as_co_author: bool,
+    pub handoff_enabled: bool,
+    pub sandbox_enabled: bool,
     pub mascot: MascotPack,
     pub detected_browsers: Vec<DetectedBrowser>,
     pub selected_browser: Option<DetectedBrowser>,
@@ -711,6 +723,7 @@ pub struct AppState {
     pub flows: Vec<FlowLane>,
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     pub request_count: u64,
+    pub last_tool_call_ms: Option<u128>,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     usage_dirty_turns: u64,
@@ -1058,6 +1071,8 @@ impl AppState {
             mascot_seed,
             partner_binagotchy_seed,
             set_catdesk_as_co_author: config.set_catdesk_as_co_author,
+            handoff_enabled: config.handoff_enabled,
+            sandbox_enabled: config.sandbox_enabled,
             mascot,
             workspace_root,
             detected_browsers: Vec::new(),
@@ -1067,6 +1082,7 @@ impl AppState {
             flows: Vec::new(),
             flow_bootstrap_progress: HashMap::new(),
             request_count: 0,
+            last_tool_call_ms: None,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             usage_dirty_turns: 0,
@@ -1115,6 +1131,8 @@ impl AppState {
         config.chatgpt_connector_revision = self.chatgpt_connector_revision;
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
         config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
+        config.handoff_enabled = self.handoff_enabled;
+        config.sandbox_enabled = self.sandbox_enabled;
         config.theme = self.theme.clone();
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
@@ -1236,6 +1254,9 @@ impl AppState {
         let only_bootstrap_status_events = events_are_bootstrap_status_events(events);
         let starts_tool_call = direction == FlowDirection::Forward
             && events.iter().any(|event| event.starts_with("tools/call:"));
+        if starts_tool_call {
+            self.last_tool_call_ms = Some(now_ms);
+        }
 
         if let Some(idx) = self.flows.iter().position(|flow| flow.flow_id == flow_id) {
             let mut flow = self.flows.remove(idx);
@@ -1632,6 +1653,8 @@ mod tests {
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         assert!(matches!(app.show_detail_mode, ShowDetailMode::Collapsed));
         assert!(app.set_catdesk_as_co_author);
+        assert!(!app.handoff_enabled);
+        assert!(app.sandbox_enabled);
         assert_eq!(
             app.partner_binagotchy_seed.as_deref(),
             Some("00000000000000ff")
@@ -1774,6 +1797,7 @@ toolCallCount = 1
         app.theme = "neon".into();
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
+        app.handoff_enabled = true;
         app.usage_by_model
             .entry(CURRENT_USAGE_BUCKET.to_string())
             .or_default()
@@ -1785,6 +1809,7 @@ toolCallCount = 1
         assert_eq!(saved.theme, "neon");
         assert!(matches!(saved.mode, Mode::Computer));
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
+        assert!(saved.handoff_enabled);
         let saved_usage = saved
             .usage_by_model
             .get(CURRENT_USAGE_BUCKET)
@@ -1801,6 +1826,7 @@ toolCallCount = 1
         )
         .expect("reload app state");
         assert_eq!(reloaded.all_time_usage_totals().total_tokens, 20);
+        assert!(reloaded.handoff_enabled);
         assert_eq!(reloaded.session_usage_totals, UsageTotals::default());
 
         let _ = std::fs::remove_file(config_path);
@@ -1958,6 +1984,29 @@ toolCallCount = 1
     }
 
     #[test]
+    fn app_config_round_trips_disabled_sandbox() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("catdesk-config-sandbox-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp config dir");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+
+        let config = AppConfig {
+            sandbox_enabled: false,
+            ..AppConfig::default()
+        };
+        config.save_to_path(&config_path).expect("save config");
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load config");
+        assert!(!saved.sandbox_enabled);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
     fn app_config_round_trips_macos_terminal_profile_preference() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -2091,11 +2140,13 @@ toolCallCount = 0
     fn record_flow_tool_call_does_not_activate_bootstrap_status() {
         let (mut app, workspace, config_path) = test_app("catdesk-flow-tool-call");
 
+        assert!(app.last_tool_call_ms.is_none());
         app.record_flow(
             "stateless",
             &["tools/call:run_command".to_string()],
             FlowDirection::Forward,
         );
+        assert!(app.last_tool_call_ms.is_some());
 
         let flow = app.flows.first().expect("missing flow");
         assert!(!flow.bootstrap_status_active);

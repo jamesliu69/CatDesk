@@ -66,7 +66,7 @@ pub enum LaunchAction {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn parse_terminal_profile_choice(input: &str) -> Option<bool> {
+pub(crate) fn parse_terminal_profile_choice(input: &str) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "" | "y" | "yes" => Some(true),
         "n" | "no" => Some(false),

@@ -1695,7 +1695,7 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 11);
+        assert_eq!(widgets.len(), 10);
         assert_eq!(
             widgets
                 .iter()
@@ -1711,7 +1711,6 @@ mod tests {
                 "search",
                 "write",
                 "edit",
-                "create_handoff",
                 "delete",
             ]
         );
@@ -2422,12 +2421,13 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::create_dir_all(&config_root).expect("create config dir");
 
-        let app = AppState::new_for_test(
+        let mut app = AppState::new_for_test(
             8787,
             workspace_root.to_string_lossy().into_owned(),
             config_path.clone(),
         )
         .expect("create app state");
+        app.sandbox_enabled = false;
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = unbounded_channel();
         let command_jobs = CommandJobManager::new();
@@ -2923,6 +2923,8 @@ async fn post_mcp_inner(
         tool_mode,
         set_catdesk_as_co_author,
         public_base_url,
+        handoff_enabled,
+        sandbox_enabled,
         mcp_path,
         partner_binagotchy_seed,
         app_show_detail_mode,
@@ -2935,6 +2937,8 @@ async fn post_mcp_inner(
             app.tool_mode,
             app.set_catdesk_as_co_author,
             app.public_base_url.clone(),
+            app.handoff_enabled,
+            app.sandbox_enabled,
             app.mcp_path(),
             app.partner_binagotchy_seed.clone(),
             app.show_detail_mode,
@@ -2963,6 +2967,8 @@ async fn post_mcp_inner(
         mode,
         tool_mode,
         set_catdesk_as_co_author,
+        handoff_enabled,
+        sandbox_enabled,
         &s.command_jobs,
         &s.devtools,
         show_detail_mode,
