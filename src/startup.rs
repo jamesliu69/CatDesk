@@ -745,7 +745,7 @@ fn mascot_fill_depths(occupancy: &[Vec<bool>]) -> (Vec<Vec<Option<usize>>>, usiz
 }
 
 fn version_label() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
+    format!("J.{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn draw_skip_hint(frame: &mut Frame, area: Rect, palette: &theme::Palette) {
@@ -813,7 +813,7 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("█▀▀ █▀█"));
-        assert!(text.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains(concat!("J.", env!("CARGO_PKG_VERSION"))));
         assert!(text.contains("press any key to skip"));
         assert!(text.contains('▀') || text.contains('▄') || text.contains('█'));
         assert!(!text.contains("WORKSPACE LINK"));
@@ -832,7 +832,7 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains("█▀▀ █▀█"));
-        assert!(text.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains(concat!("J.", env!("CARGO_PKG_VERSION"))));
         assert!(text.contains('▀') || text.contains('▄') || text.contains('█'));
     }
 

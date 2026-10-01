@@ -2257,7 +2257,7 @@ fn draw_tui_header(f: &mut Frame, area: Rect, palette: &theme::Palette, title: &
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
+    let version = format!("J.{} ", env!("CARGO_PKG_VERSION"));
     let version_width = terminal_cell_width(&version) as u16;
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -3368,7 +3368,7 @@ mod tests {
         let row = (0..60)
             .map(|column| buffer[(column, 1)].symbol())
             .collect::<String>();
-        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let version = format!("J.{}", env!("CARGO_PKG_VERSION"));
 
         assert!(row.contains("CatDesk"));
         assert!(row.ends_with(&format!("{version} │")));
